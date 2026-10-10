@@ -31,6 +31,11 @@ def _mono(cols: list[str]) -> list[int]:
     return [MONOTONE.get(c, 0) for c in cols]
 
 
+def _jobs(cfg: Cfg) -> int | None:
+    """num_threads=0 交给 LightGBM 自己决定，否则显式限制核数"""
+    return cfg.num_threads if cfg.num_threads and cfg.num_threads > 0 else None
+
+
 # ---------------------------------------------------------------- 阶段 1：分位数
 def train_one(
     X: pd.DataFrame,
@@ -53,6 +58,7 @@ def train_one(
         colsample_bytree=cfg.colsample,
         random_state=seed,
         verbose=-1,
+        n_jobs=_jobs(cfg),
     )
     m.fit(X, y, sample_weight=w)
     return m
@@ -86,6 +92,7 @@ def train_prior(
         monotone_constraints_method="advanced",
         random_state=seed,
         verbose=-1,
+        n_jobs=_jobs(cfg),
     )
     m.fit(X, y, sample_weight=w)
     return m

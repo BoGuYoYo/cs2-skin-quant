@@ -55,6 +55,8 @@ class Cfg:
     reg_lambda: float = 5.0
     subsample: float = 0.8
     colsample: float = 0.7
+    # 0 = 用满所有核。2 核小机器上建议显式设成 2，避免 OpenMP 线程争抢反而更慢。
+    num_threads: int = field(default_factory=lambda: _i("NUM_THREADS", 0))
 
     # ---------------- 验证 ----------------
     n_splits: int = 6
