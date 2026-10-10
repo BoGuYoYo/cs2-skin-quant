@@ -1,0 +1,6 @@
+# 本地开发用的变量（wrangler dev 会读取）
+# 生产环境请用： wrangler secret put INGEST_TOKEN
+INGEST_TOKEN=dev-token-change-me
+REQUIRE_AUTH=false
+UPSTREAM_BASE=
+CACHE_TTL=60

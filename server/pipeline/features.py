@@ -1,0 +1,152 @@
+"""特征工程：把你的经验法则翻译成可计算因子。
+
+三个必须记住的纪律：
+  1) 所有特征只能用 t 时刻及之前的数据（滞后特征不要 shift 反了）
+  2) 「下跌持续天数」用的是 30 日最高价，不是全历史最高价
+  3) 相对强度（相对大盘）必须做，否则大盘下行期会刷出一堆假机会
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+from .config import FEATURE_COLS
+
+
+def drop_duration(price: pd.Series, win: int = 30) -> pd.Series:
+    """当前价低于过去 win 日最高价的连续天数 —— 你的「2~4 周」先验的直接度量"""
+    high = price.rolling(win, min_periods=5).max()
+    under = (price < high).astype(int)
+    return under.groupby((under == 0).cumsum()).cumsum()
+
+
+def build(
+    hist: pd.DataFrame,
+    case_df: pd.DataFrame | None = None,
+    index_df: pd.DataFrame | None = None,
+    events_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    hist:     item_id, date, price, bid, listings, volume, supply
+    case_df:  case_id, case_name, rarity_score, case_volume_30d, supply_growth_30d, drop_pool
+    index_df: date, index_value
+    events_df: date, direction, affected_cases, confidence（LLM 事件表）
+    返回：原始列 + FEATURE_COLS
+    """
+    df = hist.sort_values(["item_id", "date"]).copy()
+    if df.empty:
+        return df
+    g = df.groupby("item_id", group_keys=False)
+
+    # ---------------------------------------------------------- 价格形态
+    df["logp"] = np.log(df["price"].clip(lower=0.5))
+    df["ret_1d"] = g["logp"].diff()
+    for w in (7, 14, 21, 30):
+        df[f"ret_{w}d"] = g["logp"].diff(w)
+
+    roll_high = g["price"].transform(lambda s: s.rolling(30, min_periods=5).max())
+    df["dd_from_high"] = df["price"] / roll_high - 1.0
+    df["drop_duration_days"] = g["price"].transform(drop_duration)
+
+    df["vol_21"] = g["ret_1d"].transform(lambda s: s.rolling(21, min_periods=10).std())
+    mu60 = g["ret_1d"].transform(lambda s: s.rolling(60, min_periods=20).mean())
+    sd60 = g["ret_1d"].transform(lambda s: s.rolling(60, min_periods=20).std())
+    df["vol_z"] = (df["ret_1d"] - mu60) / sd60.replace(0, np.nan)
+
+    # ------------------------------------------------ 供给面（你的核心洞察）
+    df["turnover"] = df["volume"] / df["supply"].replace(0, np.nan)
+    df["turnover_ma7"] = g["turnover"].transform(lambda s: s.rolling(7, min_periods=3).mean())
+    df["list_ratio"] = df["listings"] / df["supply"].replace(0, np.nan)
+    df["list_slope_7d"] = g["listings"].transform(lambda s: s.pct_change(7)) * 100
+
+    # 存世量在同箱同品质内的分位（你说的「低于平均值」的精确形式）
+    if "case_id" in df.columns:
+        df["supply_peer_pct"] = df.groupby(["case_id", "date"])["supply"].rank(pct=True)
+    else:
+        df["supply_peer_pct"] = df.groupby("date")["supply"].rank(pct=True)
+
+    # 合并箱子层数据
+    if case_df is not None and not case_df.empty and "case_id" in df.columns:
+        cols = [c for c in ("case_id", "rarity_score", "case_volume_30d", "supply_growth_30d",
+                            "drop_pool", "rationale", "blocking_risk") if c in case_df.columns]
+        df = df.merge(case_df[cols].drop_duplicates("case_id"), on="case_id", how="left")
+    for col, default in (("rarity_score", 50.0), ("case_volume_30d", np.nan),
+                         ("supply_growth_30d", np.nan), ("drop_pool", "unknown")):
+        if col not in df.columns:
+            df[col] = default
+    df["case_rarity_score"] = df["rarity_score"].fillna(50.0)
+
+    # 供给刚性合成：箱子稀有（高）+ 存世增速低 → 供给接近饱和
+    growth = df["supply_growth_30d"].fillna(3.0).clip(lower=0)
+    df["supply_rigidity"] = (df["case_rarity_score"] / 100.0) * (1.0 - np.tanh(growth / 5.0))
+
+    # ---------------------------------------------------------- 相对强度
+    if index_df is not None and not index_df.empty:
+        idx = index_df.copy()
+        idx["date"] = pd.to_datetime(idx["date"])
+        idx = idx.sort_values("date").set_index("date")["index_value"]
+        # 指数收益按日对齐后再映射，避免日期错位
+        idx_logret = np.log(idx).diff()
+        df = df.merge(
+            pd.DataFrame({
+                "date": idx.index,
+                "mkt_7": idx_logret.rolling(7, min_periods=3).sum().values,
+                "mkt_21": idx_logret.rolling(21, min_periods=10).sum().values,
+            }),
+            on="date",
+            how="left",
+        )
+        df["rel_ret_7d"] = df["ret_7d"] - df["mkt_7"].fillna(0)
+        df["rel_ret_21d"] = df["ret_21d"] - df["mkt_21"].fillna(0)
+    else:
+        df["rel_ret_7d"] = df["ret_7d"]
+        df["rel_ret_21d"] = df["ret_21d"]
+
+    # ------------------------------------------------------- LLM 事件特征
+    df["event_bearish_30d"] = 0
+    df["event_bullish_30d"] = 0
+    df["event_conf_max"] = 0.0
+    if events_df is not None and not events_df.empty:
+        ev = events_df.copy()
+        ev["date"] = pd.to_datetime(ev["date"])
+        ev = ev[ev["direction"].isin(("bullish", "bearish"))]
+        if not ev.empty:
+            agg = (
+                ev.assign(bear=(ev["direction"] == "bearish").astype(int),
+                          bull=(ev["direction"] == "bullish").astype(int))
+                .groupby(pd.Grouper(key="date", freq="D"))
+                .agg(event_bearish_30d=("bear", "sum"),
+                     event_bullish_30d=("bull", "sum"),
+                     event_conf_max=("confidence", "max"))
+                .reset_index()
+            )
+            agg["event_bearish_30d"] = agg["event_bearish_30d"].rolling(30, min_periods=1).sum()
+            agg["event_bullish_30d"] = agg["event_bullish_30d"].rolling(30, min_periods=1).sum()
+            agg["event_conf_max"] = agg["event_conf_max"].rolling(30, min_periods=1).max()
+            df = df.merge(agg, on="date", how="left", suffixes=("", "_ev"))
+            for c in ("event_bearish_30d", "event_bullish_30d", "event_conf_max"):
+                if f"{c}_ev" in df.columns:
+                    df[c] = df[f"{c}_ev"].fillna(df[c])
+                    df.drop(columns=[f"{c}_ev"], inplace=True)
+                df[c] = df[c].fillna(0)
+
+    for c in FEATURE_COLS:
+        if c not in df.columns:
+            df[c] = 0.0
+
+    # 窗口预热标记：长窗口特征齐全才算「可用样本」。
+    # 前 30 天的样本必须排除，否则等于拿噪声训练模型。
+    df["is_warm"] = (
+        df["ret_30d"].notna() & df["dd_from_high"].notna() & df["vol_21"].notna()
+    )
+
+    # 按品种前向填充，残余 NaN 归零 —— 保证推理阶段永远拿到完整向量。
+    # 注意：fillna 发生在 is_warm 计算之后，所以预热期样本仍会被标记为不可用。
+    for c in FEATURE_COLS:
+        df[c] = df.groupby("item_id")[c].ffill().fillna(0.0)
+    return df
+
+
+def latest_cross_section(df: pd.DataFrame) -> pd.DataFrame:
+    """取每个 item 的最后一行 —— 推理只用这一行"""
+    return df.sort_values("date").groupby("item_id", as_index=False).last()

@@ -1,0 +1,27 @@
+# 依赖
+node_modules/
+web/node_modules/
+web/dist/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 本地状态（含模型与数据库，绝不入库）
+server/state/
+state/
+*.pkl
+*.sqlite
+*.sqlite3
+
+# 密钥
+.dev.vars
+.env
+.env.local
+*.key
+
+# 构建与工具
+.wrangler/
+dist/
+.DS_Store
+Thumbs.db

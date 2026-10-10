@@ -1,0 +1,35 @@
+# /etc/systemd/system/skin-alpha-api.service
+#
+# 服务器侧只读 API（可选组件）。Tunnel 只需要连到 127.0.0.1:8788，
+# 服务器不需要开放任何入站端口。
+#
+#   sudo cp scripts/skin-alpha-api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now skin-alpha-api
+#
+# 定时跑管线用 systemd timer（比 cron 更好排障）。
+
+[Unit]
+Description=skin-alpha server API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=skinalpha
+WorkingDirectory=/opt/skin-alpha/server
+EnvironmentFile=/opt/skin-alpha/server/.env
+ExecStart=/opt/skin-alpha/server/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8788
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/skin-alpha/api.log
+StandardError=append:/var/log/skin-alpha/api.log
+
+# 安全加固：只读文件系统 + 无特权
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/skin-alpha/server/state /var/log/skin-alpha
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+# 跨平台行尾规范：Windows 上开发、Linux 服务器上跑，不统一的话 diff 会全是噪声
+* text=auto eol=lf
+
+# Windows 专用脚本保持 CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary
+*.pkl binary
+
+# 语言统计：把这些标为文档，避免污染 GitHub 的语言占比
+*.md linguist-documentation

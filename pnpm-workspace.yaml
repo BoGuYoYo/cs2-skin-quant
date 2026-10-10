@@ -1,0 +1,9 @@
+packages:
+  - 'web'
+
+# pnpm 11 默认禁止依赖执行 postinstall 脚本（供应链防护）。
+# esbuild 需要它来落地平台二进制，workerd 需要它来下载 wrangler 的运行时；
+# 不放行的话，vite build 和 wrangler dev/deploy 都会失败。
+allowBuilds:
+  esbuild: true
+  workerd: true

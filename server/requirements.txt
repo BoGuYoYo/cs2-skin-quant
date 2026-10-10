@@ -1,0 +1,10 @@
+# 服务器端管线依赖（Python 3.11+）
+# 安装： pip install -r requirements.txt
+pandas>=2.2
+numpy>=1.26
+lightgbm>=4.3
+scikit-learn>=1.5
+requests>=2.32
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-dotenv>=1.0
