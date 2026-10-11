@@ -2,6 +2,16 @@
 
 CS2 饰品量化看板 —— 服务器跑模型，Cloudflare 跑边缘。
 
+**🌐 线上地址：https://boguzephyr.shop**（备选：https://skin.boguzephyr.shop）
+
+> 部署状态（2026-10-11）：
+> - Cloudflare：D1 `skin_alpha` + KV `CACHE` + Worker `skin-alpha`（版本 `76c298b7`）+ Cron `0 2 * * *` + Secret `INGEST_TOKEN` 全部就绪
+> - 域名：`boguzephyr.shop` NS 已指向 Cloudflare，zone 已 `active`，两个域名证书均已签发
+> - 推送通道：**D1 REST API**（`PUSH_MODE=d1`）—— 因为 `*.workers.dev` 在部分网络被 SNI 阻断
+>
+> ⚠️ 国内直连 Cloudflare 边缘**不稳定**（实测成功率 60~75%，会偶发 TLS 失败）。
+> 建议通过代理访问，或在前端接受偶发失败后重试。
+
 - **后端（你的服务器）**：Python 管线，负责采集 → 特征 → 分位数回归 → 校准 → 决策 → 推送。LightGBM 只能跑在 Python 里，这是整个架构的分界线。
 - **边缘（Cloudflare）**：一个 Worker 同时承担静态前端、只读 API、KV 缓存、Cron 数据维护，以及一个受 token 保护的推送入口。**服务器不需要开任何入站端口。**
 
