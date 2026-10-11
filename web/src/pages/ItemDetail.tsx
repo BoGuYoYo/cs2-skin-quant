@@ -49,7 +49,7 @@ export default function ItemDetail() {
 
   return (
     <>
-      <div className="topbar">
+      <div className="ark-pageHead">
         <div style={{ display: 'flex', gap: 14, alignItems: 'center' }}>
           {it?.image ? (
             <img src={it.image} alt="" style={{ width: 96, height: 66, objectFit: 'contain', background: 'var(--bg-3)', borderRadius: 8 }} />
@@ -60,7 +60,7 @@ export default function ItemDetail() {
               {it?.market_hash_name ?? '—'}
               {it?.wear ? ` · ${it.wear}` : ''}
             </div>
-            <div className="badge-row" style={{ marginTop: 8 }}>
+            <div className="ark-pageActions" style={{ marginTop: 8 }}>
               {it?.case_name ? <span className="tag t-mute">{it.case_name}</span> : null}
               <span className={`tag t-${side.tone}`}>{side.text}</span>
               <span className={`tag t-${fit.tone}`}>下跌 {f?.drop_duration_days ?? '—'} 天 · {fit.text}</span>
@@ -80,7 +80,7 @@ export default function ItemDetail() {
       </div>
 
       <div className="grid g2" style={{ marginBottom: 14 }}>
-        <div className="card">
+        <div className="ark-panel">
           <h3>预测区间（未来 21 日，扣费后对数净收益）</h3>
           <State loading={detail.loading} error={detail.error}>
             <QuantileBand q10={fc?.q10_adj ?? null} q50={fc?.q50 ?? null} q90={fc?.q90_adj ?? null} />
@@ -102,7 +102,7 @@ export default function ItemDetail() {
           </State>
         </div>
 
-        <div className="card">
+        <div className="ark-panel">
           <h3>供给面（你的核心判断依据）</h3>
           <div className="grid g2">
             <div>
@@ -132,13 +132,13 @@ export default function ItemDetail() {
             <FactorRow label="挂单量 7 日变化" value={f?.list_slope_7d ?? null} unit="pct" />
           </div>
           {cm?.rationale ? (
-            <div className="note" style={{ marginTop: 12, marginBottom: 0 }}>
+            <div className="ark-note" style={{ marginTop: 12, marginBottom: 0 }}>
               <b>LLM 评分理由：</b>
               {cm.rationale}
             </div>
           ) : null}
           {cm?.blocking_risk ? (
-            <div className="note" style={{ marginTop: 8, marginBottom: 0, borderColor: 'rgba(255,92,92,0.25)', background: 'rgba(255,92,92,0.06)' }}>
+            <div className="ark-note" style={{ marginTop: 8, marginBottom: 0, borderColor: 'rgba(255,92,92,0.25)', background: 'rgba(255,92,92,0.06)' }}>
               <b>主要风险：</b>
               {cm.blocking_risk}
             </div>
@@ -146,12 +146,12 @@ export default function ItemDetail() {
         </div>
       </div>
 
-      <div className="card" style={{ marginBottom: 14 }}>
+      <div className="ark-panel" style={{ marginBottom: 14 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
           <h3 style={{ margin: 0 }}>K 线（底价曲线）</h3>
-          <div className="badge-row">
+          <div className="ark-pageActions">
             {[30, 90, 180, 365].map((d) => (
-              <button key={d} className={days === d ? 'primary' : 'ghost'} onClick={() => setDays(d)}>
+              <button key={d} className={days === d ? 'ark-btn is-primary' : 'ark-btn'} onClick={() => setDays(d)}>
                 {d}D
               </button>
             ))}
@@ -163,7 +163,7 @@ export default function ItemDetail() {
       </div>
 
       <div className="grid g2">
-        <div className="card">
+        <div className="ark-panel">
           <h3>动量与波动</h3>
           <FactorRow label="7 日收益" value={f?.ret_7d ?? null} unit="pct" />
           <FactorRow label="21 日收益" value={f?.ret_21d ?? null} unit="pct" />
@@ -181,11 +181,11 @@ export default function ItemDetail() {
           </div>
         </div>
 
-        <div className="card">
+        <div className="ark-panel">
           <h3>历史异动</h3>
           <State loading={detail.loading} error={detail.error} empty={(detail.data?.alerts ?? []).length === 0}
                  emptyText="没有触发过告警">
-            <div className="table-wrap" style={{ border: 'none' }}>
+            <div className="ark-tableWrap" style={{ border: 'none' }}>
               <table>
                 <thead>
                   <tr>

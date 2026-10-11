@@ -18,17 +18,17 @@ export default function Alerts() {
 
   return (
     <>
-      <div className="topbar">
+      <div className="ark-pageHead">
         <div>
           <h1>异动提醒</h1>
-          <div className="sub">
+          <div className="ark-sub">
             分级逻辑：L1 观察（-8%）· L2 注意（-15%）· L3 强警（-25%）
             {Object.keys(counts).length > 0 && <> · 本页 L3 {counts.L3 ?? 0} 条</>}
           </div>
         </div>
-        <div className="badge-row">
+        <div className="ark-pageActions">
           {['', 'L3', 'L2', 'L1'].map((lv) => (
-            <button key={lv || 'all'} className={level === lv ? 'primary' : 'ghost'} onClick={() => setLevel(lv)}>
+            <button key={lv || 'all'} className={level === lv ? 'ark-btn is-primary' : 'ark-btn'} onClick={() => setLevel(lv)}>
               {lv || '全部'}
             </button>
           ))}
@@ -37,17 +37,17 @@ export default function Alerts() {
               <option key={n} value={n}>{n} 条</option>
             ))}
           </select>
-          <button className="ghost" onClick={() => q.reload()}>刷新</button>
+          <button className="ark-btn" onClick={() => q.reload()}>刷新</button>
         </div>
       </div>
 
-      <div className="note">
+      <div className="ark-note">
         提醒会按冷却期去重（同品同级 2~12 小时只发一次）。这里展示的是落库后的完整历史，
         手机推送只是它的一份拷贝——两者不一致时以本页为准。
       </div>
 
       <State loading={q.loading} error={q.error} empty={rows.length === 0} emptyText="还没有触发过告警">
-        <div className="table-wrap">
+        <div className="ark-tableWrap">
           <table>
             <thead>
               <tr>

@@ -268,8 +268,27 @@ def collect_daily_kline(
     """
     import time as _time
 
+    # 进度上报（前端实时查看）；导入失败不影响采集
+    _prog = None
+    try:
+        import os as _os
+        import sys as _sys
+        _srv = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        if _srv not in _sys.path:
+            _sys.path.insert(0, _srv)
+        from push import progress as _prog  # type: ignore
+    except Exception:
+        _prog = None
+
     stats = {"ok": 0, "empty": 0, "fail": 0, "rows": 0}
     t0 = _time.time()
+    started_at = int(t0)
+    if _prog:
+        _prog.report("collect", "running", force=True, total=len(names), done=0,
+                     ok=0, empty=0, fail=0, rows=0,
+                     eta_minutes=len(names) * sleep / 60, started_at=started_at,
+                     message=f"K线采集 {len(names)} 个品种")
+
     for i, name in enumerate(names, 1):
         try:
             rows = fetch_kline(session, api_key, name, KLINE_TYPE_DAY, platform)
@@ -295,9 +314,19 @@ def collect_daily_kline(
                      i, len(names), i / len(names) * 100, stats["ok"], stats["empty"],
                      stats["fail"], stats["rows"], i / el * 60,
                      (len(names) - i) / max(i / el, 1e-9) / 60)
+            if _prog:
+                _prog.report("collect", "running",
+                             **_prog.progress_fields(i, len(names), t0, stats["ok"],
+                                                     stats["empty"], stats["fail"],
+                                                     stats["rows"], started_at))
         _time.sleep(sleep)
 
     con.commit()
+    if _prog:
+        _prog.finish("collect",
+                     message=f"完成：成功 {stats['ok']}，空 {stats['empty']}，失败 {stats['fail']}",
+                     total=len(names), done=len(names), ok=stats["ok"], empty=stats["empty"],
+                     fail=stats["fail"], rows=stats["rows"], eta_minutes=0, started_at=started_at)
     log.info("K线采集完成：成功 %d 空 %d 失败 %d，写入 %d 行，耗时 %.1f 分钟",
              stats["ok"], stats["empty"], stats["fail"], stats["rows"], (_time.time() - t0) / 60)
     return stats

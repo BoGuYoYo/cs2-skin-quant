@@ -173,6 +173,16 @@ readRoutes.get('/items/:id', async (c) => {
   return ok(data);
 });
 
+// ---------------------------------------------------------------- 任务进度
+// 不缓存：KV 的 expirationTtl 最小 60 秒，缓存会让刚写入的进度消失一分钟。
+// 前端 5 秒轮询一次，直接查 D1 的开销完全可以接受（索引走 updated_at）。
+readRoutes.get('/progress', async (c) => {
+  const r = await c.env.DB.prepare(
+    'SELECT * FROM task_progress ORDER BY updated_at DESC LIMIT 20',
+  ).all();
+  return ok(r.results);
+});
+
 // ---------------------------------------------------------------- K 线
 readRoutes.get('/items/:id/kline', async (c) => {
   const id = clampStr(c.req.param('id'), 64);

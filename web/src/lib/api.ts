@@ -171,6 +171,23 @@ export interface ScreenerRow {
   supply_rigidity: number | null;
 }
 
+/** 回填 / 采集 / 训练的实时进度 */
+export interface TaskProgress {
+  task: string;
+  status: 'running' | 'done' | 'failed' | 'idle' | string;
+  total: number | null;
+  done: number | null;
+  ok: number | null;
+  empty: number | null;
+  fail: number | null;
+  rows: number | null;
+  rate_per_min: number | null;
+  eta_minutes: number | null;
+  message: string | null;
+  started_at: number | null;
+  updated_at: number;
+}
+
 // ------------------------------------------------------------------ 接口
 export const api = {
   meta: () => get<Meta>('/api/meta'),
@@ -184,6 +201,7 @@ export const api = {
   alerts: (p: Params = {}) => get<AlertRow[]>('/api/alerts', p),
   cases: (p: Params = {}) => get<CaseRow[]>('/api/cases', p),
   backtest: () => get<{ date: string; mean_21d: number; cum: number; win_rate: number; n: number }[]>('/api/backtest'),
+  progress: () => get<TaskProgress[]>('/api/progress'),
   search: (q: string) =>
     get<{ item_id: string; name: string; market_hash_name: string; case_name: string | null; image: string | null }[]>(
       '/api/search',

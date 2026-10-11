@@ -63,6 +63,8 @@ STAGES: dict[str, list[str]] = {
     "backtest": ["date", "mean_21d", "cum", "win_rate", "n", "model_version"],
     "meta": ["k", "v", "updated_at"],
     "runs": ["ts", "stage", "ok", "rows", "message"],
+    "task_progress": ["task", "status", "total", "done", "ok", "empty", "fail",
+                      "rows", "rate_per_min", "eta_minutes", "message", "started_at", "updated_at"],
 }
 
 
@@ -321,7 +323,13 @@ _TABLE_MAP = {
 
 
 def _table_of(stage: str) -> str:
-    return _TABLE_MAP[stage]
+    """表名与 stage 名一一对应 —— 直接用 stage 当表名。
+
+    以前这里维护了一份 _TABLE_MAP，加新表时容易漏改（踩过：加了 task_progress
+    到 STAGES 但忘了加映射，运行时报 KeyError）。stage 本身已在 STAGES 里做过
+    白名单校验，所以这里直接返回是安全的。
+    """
+    return stage
 
 
 def push_many(items: dict[str, Sequence[dict[str, Any]]]) -> dict[str, int]:

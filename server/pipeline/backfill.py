@@ -35,6 +35,15 @@ except ImportError:
 from . import collector
 from .config import CFG
 
+# 上报进度给前端（push 包在 server/ 下，不在 pipeline/ 里）
+_SERVER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SERVER_DIR not in sys.path:
+    sys.path.insert(0, _SERVER_DIR)
+try:
+    from push import progress as task_progress  # noqa: E402
+except Exception:  # 前端进度是锦上添花，缺了也要能跑
+    task_progress = None  # type: ignore
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-7s %(name)-10s %(message)s",
@@ -155,6 +164,13 @@ def main() -> int:
     est = len(todo) * SLEEP_PER_CALL / 60
     log.info("预计耗时 %.0f 分钟（每品种 %.2fs，配额 120 次/分钟）", est, SLEEP_PER_CALL)
 
+    started_at = int(time.time())
+    if task_progress:
+        task_progress.report("backfill", "running", force=True,
+                             total=len(todo), done=0, ok=0, empty=0, fail=0, rows=0,
+                             eta_minutes=est, started_at=started_at,
+                             message=f"日线回填 {len(todo)} 个品种")
+
     session = requests.Session()
     ok = fail = empty = total_rows = 0
     t0 = time.time()
@@ -195,9 +211,21 @@ def main() -> int:
             eta = (len(todo) - i) / max(rate, 1e-6)
             log.info("进度 %d/%d（%.1f%%）成功 %d 空 %d 失败 %d 行数 %d | %.0f 个/分钟 | 剩余 %.0f 分钟",
                      i, len(todo), i / len(todo) * 100, ok, empty, fail, total_rows, rate, eta)
+            if task_progress:
+                task_progress.report(
+                    "backfill", "running",
+                    **task_progress.progress_fields(i, len(todo), t0, ok, empty, fail, total_rows, started_at),
+                )
         time.sleep(SLEEP_PER_CALL)
 
     con.commit()
+    if task_progress:
+        task_progress.finish(
+            "backfill",
+            message=f"完成：成功 {ok}，空 {empty}，失败 {fail}，共 {total_rows:,} 行",
+            total=len(todo), done=len(todo), ok=ok, empty=empty, fail=fail,
+            rows=total_rows, eta_minutes=0, started_at=started_at,
+        )
     log.info("回填完成：成功 %d，空数据 %d，失败 %d，写入 %d 行，耗时 %.1f 分钟",
              ok, empty, fail, total_rows, (time.time() - t0) / 60)
     status(con)

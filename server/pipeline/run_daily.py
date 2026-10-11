@@ -35,6 +35,7 @@ from .model import QuantileModel, acceptance, walk_forward
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from push import dispatch, notify  # noqa: E402
+from push import progress as task_progress  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -250,11 +251,15 @@ def run(dry_run: bool = False, backtest_only: bool = False) -> int:
         return 0 if ok else 1
 
     # ---------------- 4. 模型 + 校准 ----------------
+    task_progress.report("train", "running", force=True,
+                         message=f"训练中（{len(labeled):,} 行特征）")
     try:
         mdl, cqr, calib_meta = load_or_train(cfg, labeled)
+        task_progress.finish("train", message=f"训练完成 · {cfg.model_version}")
     except RuntimeError as e:
         log.error("%s", e)
         fails.append(str(e))
+        task_progress.fail("train", str(e))
         if not dry_run:
             log.warning("冷启动期：跳过预测，但仍推送已采集的基础数据（items / kline）")
             _push_cold_start(con, cfg, day, now_ts, hist, str(e))

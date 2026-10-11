@@ -31,31 +31,31 @@ export default function Candidates() {
 
   return (
     <>
-      <div className="topbar">
+      <div className="ark-pageHead">
         <div>
           <h1>候选池</h1>
-          <div className="sub">
+          <div className="ark-sub">
             {mode === 'pool'
               ? `模型打分排序 · 基准日 ${pool.data?.date ?? '—'}`
               : '经验法则筛选：小件 + 相对稀缺 + 箱子稀有 + 抛压不重 + 有真实换手'}
           </div>
         </div>
-        <div className="badge-row">
-          <button className={mode === 'pool' ? 'primary' : 'ghost'} onClick={() => setMode('pool')}>
+        <div className="ark-pageActions">
+          <button className={mode === 'pool' ? 'ark-btn is-primary' : 'ark-btn'} onClick={() => setMode('pool')}>
             模型候选
           </button>
-          <button className={mode === 'screener' ? 'primary' : 'ghost'} onClick={() => setMode('screener')}>
+          <button className={mode === 'screener' ? 'ark-btn is-primary' : 'ark-btn'} onClick={() => setMode('screener')}>
             经验筛选
           </button>
         </div>
       </div>
 
-      <div className="note">
+      <div className="ark-note">
         「下跌天数」落在 <b>14~30 天</b> 才是甜蜜区——这是你的时间先验。<b>P10</b> 是校准后的下沿：
         它若为负，说明模型认为存在实质亏损风险，无论 P50 多漂亮都不该建仓。
       </div>
 
-      <div className="toolbar">
+      <div className="ark-toolbar">
         {mode === 'pool' ? (
           <>
             <label>
@@ -107,7 +107,7 @@ export default function Candidates() {
             ))}
           </select>
         </label>
-        <button className="ghost" onClick={() => (mode === 'pool' ? pool.reload() : scr.reload())}>
+        <button className="ark-btn" onClick={() => (mode === 'pool' ? pool.reload() : scr.reload())}>
           刷新
         </button>
       </div>
@@ -124,7 +124,7 @@ export default function Candidates() {
       ) : (
         <State loading={scr.loading} error={scr.error} empty={(scr.data ?? []).length === 0}
                emptyText="当前筛选条件下没有标的——放宽箱稀有度或换手率试试">
-          <div className="table-wrap">
+          <div className="ark-tableWrap">
             <table>
               <thead>
                 <tr>

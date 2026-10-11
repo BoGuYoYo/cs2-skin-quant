@@ -70,6 +70,12 @@ const STAGES: Record<string, Stage> = {
     cols: ['k', 'v', 'updated_at'],
     pk: ['k'],
   },
+  task_progress: {
+    table: 'task_progress',
+    cols: ['task', 'status', 'total', 'done', 'ok', 'empty', 'fail',
+           'rows', 'rate_per_min', 'eta_minutes', 'message', 'started_at', 'updated_at'],
+    pk: ['task'],
+  },
   runs: {
     table: 'runs',
     cols: ['ts', 'stage', 'ok', 'rows', 'message'],
@@ -137,6 +143,16 @@ ingestRoutes.post('/ingest', async (c) => {
     .prepare('INSERT INTO runs (ts, stage, ok, rows, message) VALUES (?,?,?,?,?)')
     .bind(Date.now(), `ingest:${stageName}`, 1, inserted, `deleted=${deleted}`)
     .run();
+
+  // 写完立刻让读缓存失效。
+  // 不能靠短 TTL —— KV 的 expirationTtl 最小值是 60 秒（withCache 里被 Math.max(60,..) 夹住），
+  // 意味着一次空结果会被缓存整整一分钟，前端就看不到刚写入的进度（踩过）。
+  if (c.env.CACHE) {
+    const keys = stageName === 'task_progress'
+      ? ['progress']
+      : ['meta', 'progress'];
+    await Promise.all(keys.map((k) => c.env.CACHE!.delete(k).catch(() => undefined)));
+  }
 
   return ok({ stage: stageName, received: rows.length, inserted, deleted });
 });

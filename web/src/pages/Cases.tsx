@@ -11,32 +11,32 @@ export default function Cases() {
 
   return (
     <>
-      <div className="topbar">
+      <div className="ark-pageHead">
         <div>
           <h1>箱子稀有度</h1>
-          <div className="sub">
+          <div className="ark-sub">
             这是整套判断的支点：箱子稀有 → 新增供给趋近于零 → 下跌是存量博弈而非价值毁灭
           </div>
         </div>
-        <div className="badge-row">
-          <button className={sort === 'rarity' ? 'primary' : 'ghost'} onClick={() => setSort('rarity')}>
+        <div className="ark-pageActions">
+          <button className={sort === 'rarity' ? 'ark-btn is-primary' : 'ark-btn'} onClick={() => setSort('rarity')}>
             按稀有度
           </button>
-          <button className={sort === 'volume' ? 'primary' : 'ghost'} onClick={() => setSort('volume')}>
+          <button className={sort === 'volume' ? 'ark-btn is-primary' : 'ark-btn'} onClick={() => setSort('volume')}>
             按开箱量
           </button>
-          <button className="ghost" onClick={() => q.reload()}>刷新</button>
+          <button className="ark-btn" onClick={() => q.reload()}>刷新</button>
         </div>
       </div>
 
-      <div className="note">
+      <div className="ark-note">
         <b>箱子日成交量</b> ≈ 开箱量 ≈ 该箱物品的新增供给速率。「存世量 30 日增速」趋近 0
         说明供给已经饱和，箱子里的东西不再被源源不断地生产出来——这才是「稀缺」的可验证形式。
       </div>
 
       <State loading={q.loading} error={q.error} empty={(q.data ?? []).length === 0}
              emptyText="还没有箱子数据（管线未推送 case_meta）">
-        <div className="table-wrap">
+        <div className="ark-tableWrap">
           <table>
             <thead>
               <tr>

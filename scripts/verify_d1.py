@@ -22,6 +22,7 @@ import requests
 TABLES = [
     "items", "case_meta", "snap_daily", "kline", "forecast",
     "factor_latest", "alerts", "market_index", "backtest", "meta", "runs",
+    "task_progress",
 ]
 
 API = "https://api.cloudflare.com/client/v4/accounts/{acct}/d1/database/{db}/query"
