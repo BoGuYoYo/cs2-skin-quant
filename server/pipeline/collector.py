@@ -49,7 +49,12 @@ CREATE TABLE IF NOT EXISTS events (
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(db_path))
+    con = sqlite3.connect(str(db_path), timeout=60)
+    # 回填/采集会长时间写库，WAL + busy_timeout 让并发写入排队而不是直接报
+    # "database is locked"（踩过：cases_build 撞上回填的写事务直接失败）
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA busy_timeout=60000")
     con.executescript(SCHEMA)
     con.commit()
     return con
