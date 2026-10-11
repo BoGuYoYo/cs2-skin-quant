@@ -127,7 +127,81 @@ systemctl list-timers skin-alpha-daily.timer
 
 ---
 
-## 路径 A：保留 Cloudflare，只修访问入口
+## 路径 A′：保留 Cloudflare，推送走 D1 REST API（当前采用）
+
+**实测结论**：服务器上 `api.cloudflare.com` 可达（返回 400/301 = 连接成功），
+只有 `*.workers.dev` 被 SNI 阻断。所以推送改走 **D1 REST API**，绕开被墙的域名。
+
+```
+服务器 ──POST──▶ api.cloudflare.com/client/v4/.../d1/.../query ──▶ D1
+浏览器 ──HTTPS──▶ boguzephyr.shop ──▶ Cloudflare 边缘 ──▶ Worker ──▶ D1
+```
+
+浏览器访问的是**你的自定义域名**，不是 workers.dev，所以不受阻断影响。
+
+### 1. 创建 API Token
+
+https://dash.cloudflare.com/profile/api-tokens → **Create Token** → **Custom token**
+
+| 项 | 值 |
+|---|---|
+| Permissions | `Account` → `D1` → **Edit** |
+| Account Resources | Include → `Zephyrs Account` |
+| TTL | 建议设长期或不过期 |
+
+创建后复制 token（只显示一次）。
+
+### 2. 服务器 `.env` 配置
+
+```bash
+PUSH_MODE=d1                          # 关键：走 D1 REST 而不是 Worker
+
+CF_ACCOUNT_ID=1c27fc5ddcbf0eef8ca09cf182d93d53
+CF_D1_DATABASE_ID=e939c873-0801-40c1-a06c-4acefbfdd0e6
+CF_API_TOKEN=<第 1 步创建的 token>
+```
+
+### 3. 验证通道
+
+```bash
+python -m pipeline.run_daily --check-push
+```
+
+期望输出：
+
+```json
+{
+  "mode": "d1",
+  "describe": "Cloudflare D1 REST API 通道",
+  "d1": { "ok": true, "database": "e939c873-...", "items_probe": 0 }
+}
+```
+
+### 4. 核对线上数据
+
+```bash
+python scripts/verify_d1.py
+```
+
+会打印各表行数、最新预测日期、候选池抽样、告警抽样，以及管线健康度（距今几天）。
+
+### 关于性能：D1 REST 的两个实测限制
+
+| 限制 | 实测值 | 应对 |
+|---|---|---|
+| 参数绑定（`?`）个数 | **100 个/语句** | 代码已默认改用**字面量 SQL**（自己转义），500 行合并成 1 条语句 |
+| 单条 SQL 长度 | 90KB 可正常执行 | 超出会自动二分降级重试 |
+
+对比：参数模式下 19 列的 `factor_latest` 一次只能插 5 行，200 万行需要 40 万次请求；
+字面量模式下 1200 行 `kline` 一次搞定。**实测 1472 行 / 9.4 秒**。
+
+> ⚠️ 另一个踩过的坑：numpy 2.x 下 `repr(np.float64(-0.2645))` 会输出 `'np.float64(-0.2645)'`，
+> 而 `isinstance(np.float64(...), float)` 又是 `True`，拼进 SQL 直接语法错误。
+> `to_d1.py` 的 `_coerce()` 已用 `.item()` 归一化，并有回归测试覆盖。
+
+---
+
+## 路径 A：保留 Cloudflare，推送走 Worker（workers.dev 可达时）
 
 服务器能访问 Cloudflare 时用这条。**不需要备案**，因为对外服务的是 Cloudflare。
 
