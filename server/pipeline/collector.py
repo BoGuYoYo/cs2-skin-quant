@@ -39,11 +39,49 @@ CREATE TABLE IF NOT EXISTS snap (
   PRIMARY KEY (item_id, date)
 );
 CREATE INDEX IF NOT EXISTS ix_snap ON snap(item_id, date);
+-- kline 必须在这里建：write_kline_rows 直接写它，而 to_local.ensure_schema
+-- 只在 PUSH_MODE 含 local 时才会跑。曾经漏建导致「新库首次采集」
+-- 抛 no such table: kline，且因为先写 snap 后写 kline，留下半写入状态。
+CREATE TABLE IF NOT EXISTS kline (
+  item_id TEXT, date TEXT, o REAL, h REAL, l REAL, c REAL, v INTEGER,
+  PRIMARY KEY (item_id, date)
+);
+CREATE INDEX IF NOT EXISTS ix_kline ON kline(item_id, date);
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, event_type TEXT,
   affected_cases TEXT, direction TEXT, magnitude INTEGER,
   horizon_days INTEGER, confidence REAL, evidence TEXT, reasoning TEXT
 );
+"""
+
+
+def _upsert_sql(table: str, cols: list[str], pk: list[str]) -> str:
+    """生成 UPSERT：冲突时只更新本次提供的列，未提供的保持原值。
+
+    踩过的坑：原先统一用 INSERT OR REPLACE，而它的语义是「删掉整行再插入」，
+    于是只写价格时会把 bid/listings/volume/supply 全部清成 NULL。
+    kline 采集和 batch 采集交替跑时等于互相清空。
+    """
+    ph = ",".join(["?"] * len(cols))
+    updates = ",".join(f"{c}=excluded.{c}" for c in cols if c not in pk)
+    return (
+        f"INSERT INTO {table} ({','.join(cols)}) VALUES ({ph}) "
+        f"ON CONFLICT({','.join(pk)}) DO UPDATE SET {updates}"
+    )
+
+
+#: snap 专用：用 COALESCE 让 NULL 不覆盖已有值。
+#: kline 采集只提供价格，batch 采集会补 listings —— 两者必须能共存而不是互相清空。
+SNAP_UPSERT = """
+INSERT INTO snap (item_id, date, sell, bid, listings, volume, supply, ts)
+VALUES (?,?,?,?,?,?,?,?)
+ON CONFLICT(item_id, date) DO UPDATE SET
+  sell     = COALESCE(excluded.sell,     snap.sell),
+  bid      = COALESCE(excluded.bid,      snap.bid),
+  listings = COALESCE(excluded.listings, snap.listings),
+  volume   = COALESCE(excluded.volume,   snap.volume),
+  supply   = COALESCE(excluded.supply,   snap.supply),
+  ts       = COALESCE(excluded.ts,       snap.ts)
 """
 
 
@@ -61,31 +99,76 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 
 # --------------------------------------------------------------- SteamDT
-def fetch_prices(market_hash_names: list[str], api_key: str, session: requests.Session | None = None) -> list[dict[str, Any]]:
-    """批量拉取多平台价格。返回 [{marketHashName, BUFF:{sell,bid,listings}, ...}]"""
+#: /price/batch 的限流错误码。实测：被限流时 **不返回 HTTP 429**，
+#: 而是 HTTP 200 + {"success": false, "errorCode": 4005,
+#: "errorMsg": "当前接口请求已达到上限。详细规则请参阅接口文档。"}
+RATE_LIMIT_CODE = 4005
+
+#: 实测间隔：1 次/分钟，留 1 秒余量
+BATCH_INTERVAL = 61.0
+
+
+def _post_batch(s: requests.Session, api_key: str, chunk: list[str]) -> dict[str, Any]:
+    r = s.post(
+        f"{STEAMDT_BASE}/open/cs2/v1/price/batch",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={"marketHashNames": chunk},
+        timeout=30,
+    )
+    if r.status_code == 429:
+        return {"success": False, "errorCode": RATE_LIMIT_CODE, "errorMsg": "HTTP 429"}
+    r.raise_for_status()
+    try:
+        return r.json()
+    except ValueError:
+        return {"success": False, "errorCode": -1, "errorMsg": f"响应不是 JSON：{r.text[:120]!r}"}
+
+
+def fetch_prices(
+    market_hash_names: list[str],
+    api_key: str,
+    session: requests.Session | None = None,
+    interval: float = BATCH_INTERVAL,
+    max_retry: int = 3,
+) -> list[dict[str, Any]]:
+    """批量拉取多平台价格。返回 [{marketHashName, dataList:[{platform,sellPrice,...}]}, ...]
+
+    ⚠️ 限流识别：**不能只看 HTTP 状态码**。
+        踩过的坑：原先只判 `r.status_code == 429` 才退避，其余失败走
+        `if not body.get("success"): log.warning(...); continue` ——
+        而真实的限流正是 HTTP 200 + success=false + errorCode=4005，
+        于是被限流时既不退避也不重试，**直接丢掉这 100 个品种**。
+        日志里只留一行 warning，数据静默缺失，看上去却"跑完了"。
+        现在的纪律：限流码 → 退避重试同一批；其他失败 → 抛错让调用方看见。
+
+    interval: 每次批量请求之间的间隔秒数（1 次/分钟 → 61s）。
+              单批调用时可以传 0，由外层循环控制节奏。
+    """
     s = session or requests.Session()
     out: list[dict[str, Any]] = []
-    for i in range(0, len(market_hash_names), BATCH_MAX):
-        chunk = market_hash_names[i : i + BATCH_MAX]
-        r = s.post(
-            f"{STEAMDT_BASE}/open/cs2/v1/price/batch",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"marketHashNames": chunk},
-            timeout=30,
-        )
-        if r.status_code == 429:
-            log.warning("限流（/price/batch 为 1 次/分钟），退避 65s")
-            time.sleep(65)
-            continue
-        r.raise_for_status()
-        body = r.json()
-        if not body.get("success"):
-            log.warning("接口返回失败：%s", body.get("errorMsg"))
-            continue
-        for blk in body.get("data") or []:
-            out.append(blk)
-        if i + BATCH_MAX < len(market_hash_names):
-            time.sleep(61)  # 尊重 1 次/分钟限制
+    chunks = [market_hash_names[i : i + BATCH_MAX] for i in range(0, len(market_hash_names), BATCH_MAX)]
+
+    for idx, chunk in enumerate(chunks):
+        for attempt in range(1, max_retry + 1):
+            body = _post_batch(s, api_key, chunk)
+            if body.get("success"):
+                out.extend(body.get("data") or [])
+                break
+            code = body.get("errorCode")
+            if code == RATE_LIMIT_CODE or str(code) == str(RATE_LIMIT_CODE):
+                log.warning("限流（errorCode %s），第 %d 次退避 %.0fs 后重试同一批 %d 个",
+                            code, attempt, interval, len(chunk))
+                time.sleep(interval)
+                continue
+            # 非限流错误：参数/鉴权类问题重试也不会好，直接抛
+            raise RuntimeError(f"/price/batch 失败：errorCode={code} errorMsg={body.get('errorMsg')!r}")
+        else:
+            raise RuntimeError(
+                f"/price/batch 连续 {max_retry} 次被限流，放弃第 {idx + 1}/{len(chunks)} 批"
+                f"（{len(chunk)} 个品种）—— 这不是「跑完了」，是没拿到数据"
+            )
+        if idx + 1 < len(chunks) and interval > 0:
+            time.sleep(interval)
     return out
 
 
@@ -124,7 +207,7 @@ def write_daily_snapshot(con: sqlite3.Connection, blocks: Iterable[dict[str, Any
         if not name or not row:
             continue
         con.execute(
-            "INSERT OR REPLACE INTO snap (item_id, date, sell, bid, listings, volume, supply, ts) VALUES (?,?,?,?,?,?,?,?)",
+            SNAP_UPSERT,   # 不是 INSERT OR REPLACE：只更新提供的列，不清空已有供需字段
             (
                 name,
                 date,
@@ -262,14 +345,15 @@ def write_kline_rows(con: sqlite3.Connection, item_id: str, rows: list, write_kl
         except (IndexError, TypeError, ValueError):
             continue
         day = datetime.fromtimestamp(ts + 8 * 3600, tz=timezone.utc).strftime("%Y-%m-%d")
-        con.execute(
-            "INSERT OR REPLACE INTO snap (item_id, date, sell, bid, listings, volume, supply, ts) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (item_id, day, c, None, None, None, None, ts),
-        )
+        # 关键：K 线只提供价格，用 SNAP_UPSERT 保证它不会把 batch 采集补上的
+        # bid / listings 清成 NULL（原先的 INSERT OR REPLACE 会）
+        con.execute(SNAP_UPSERT, (item_id, day, c, None, None, None, None, ts))
         if write_kline:
             con.execute(
-                "INSERT OR REPLACE INTO kline (item_id, date, o, h, l, c, v) VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO kline (item_id, date, o, h, l, c, v) VALUES (?,?,?,?,?,?,?) "
+                "ON CONFLICT(item_id, date) DO UPDATE SET "
+                "o=excluded.o, h=excluded.h, l=excluded.l, c=excluded.c, "
+                "v=COALESCE(excluded.v, kline.v)",
                 (item_id, day, o, h, l, c, None),
             )
         n += 1
@@ -360,13 +444,22 @@ def collect_daily_kline(
 def load_history(con: sqlite3.Connection, days: int = 1200) -> pd.DataFrame:
     """读取本地快照仓 → 宽表 DataFrame
 
-    注意：K 线回填只写价格，volume/supply/listings 都是 NULL。
+    必须 JOIN items 取 case_id —— 这是供给面特征能否生效的关键。
+    踩过的坑：这里原先只 SELECT snap 的列，没有 case_id，而 features.build 的
+    箱子合并以 `if "case_id" in df.columns` 为前置条件，于是整段被静默跳过，
+    case_rarity_score 退回默认值 50、supply_rigidity 恒 0.2315 —— 23 个特征里
+    9 个是常数，MONOTONE 里针对这些列的约束等于没有约束。
+
+    另外：K 线回填只写价格，volume/supply/listings 都是 NULL。
     pandas 会把整列 NULL 推断成 object，进而让 turnover = volume/supply 也是 object，
     LightGBM 会直接拒绝（"pandas dtypes must be int, float or bool"）。
     所以这里必须显式 to_numeric 兜住。
     """
     df = pd.read_sql_query(
-        "SELECT item_id, date, sell AS price, bid, listings, volume, supply FROM snap",
+        """SELECT s.item_id, s.date, s.sell AS price, s.bid, s.listings, s.volume, s.supply,
+                  i.case_id AS case_id, i.case_name AS case_name
+             FROM snap s
+             LEFT JOIN items i ON i.item_id = s.item_id""",
         con,
     )
     if df.empty:

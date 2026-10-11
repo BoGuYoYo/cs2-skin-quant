@@ -45,6 +45,11 @@ def average_uniqueness(end_idx: np.ndarray, item_ids: np.ndarray) -> np.ndarray:
     """López de Prado 的平均唯一性：每个样本按它覆盖区间的平均重叠度降权。
 
     注意必须按 item 分别计算 —— 跨品种的「重叠」没有意义。
+
+    这里必须**两遍**：先把所有样本的覆盖区间都累加进 ind，再用最终的重叠度算唯一性。
+    踩过的坑：原先边累加边取 local[j]，排序在后的样本还没计入，
+    于是靠前的样本唯一性被高估（第一个天然拿到 1.0）、靠后的被低估。
+    实测 [2,3,4] 返回 [1.0, 0.75, 0.75]，正确是 [0.75, 0.5, 0.75]。
     """
     uniq = np.zeros(len(end_idx), dtype=float)
     for item in pd.unique(item_ids):
@@ -55,25 +60,53 @@ def average_uniqueness(end_idx: np.ndarray, item_ids: np.ndarray) -> np.ndarray:
         n = int(ends.max()) + 1
         ind = np.zeros(n, dtype=float)
         local = np.zeros(mask.size, dtype=float)
-        for j, t1 in enumerate(ends):
-            t1 = int(min(max(t1, j + 1), n))
+
+        spans = [(int(min(max(t1, j + 1), n)), j) for j, t1 in enumerate(ends)]
+
+        # 第一遍：累加全部重叠
+        for t1, j in spans:
             ind[j:t1] += 1.0
+        # 第二遍：用最终重叠度计算
+        for t1, j in spans:
             local[j] = (1.0 / ind[j:t1]).mean() if t1 > j else 0.0
+
         uniq[mask] = local
     uniq[~np.isfinite(uniq)] = 0.0
     return uniq
 
 
 def sample_weights(df: pd.DataFrame, cfg: Cfg) -> np.ndarray:
-    """时间衰减 × 唯一性 × 品种平衡，最后归一化到均值 1"""
-    age_days = (df["date"].max() - df["date"]).dt.days.to_numpy(dtype=float)
-    w_time = 0.5 ** (age_days / max(cfg.half_life_days, 1))
+    """时间衰减 × 唯一性 × 品种平衡，最后归一化到均值 1。
 
-    w_uniq = average_uniqueness(df["label_end_idx"].to_numpy(), df["item_id"].to_numpy())
+    label_end_idx 在这里**重算**，不沿用 make_labels 阶段算好的值。
+    踩过的坑：make_labels 是在全量帧上算的，而调用方传进来的通常是
+    is_warm / dropna 过滤后的子集，行位置已经变了 —— 旧的 end_idx 与
+    局部序号完全错位，唯一性权重等于随机数。
+    """
+    d = df.reset_index(drop=True)
+    n = len(d)
+    if n == 0:
+        return np.zeros(0, dtype=float)
 
-    counts = df.groupby("item_id")["item_id"].transform("size").to_numpy(dtype=float)
-    w_item = 1.0 / np.sqrt(np.maximum(counts, 1.0))
+    items = d["item_id"].to_numpy()
+    dates = d["date"].to_numpy()
 
-    w = w_time * w_uniq * w_item
+    # 按 (item_id, date) 排序后重算覆盖区间，最后再映射回原顺序
+    order = np.lexsort((dates, items))
+    items_sorted = items[order]
+    grp = pd.Series(items_sorted)
+    idx_in_item = grp.groupby(items_sorted).cumcount().to_numpy()
+    item_len = grp.groupby(items_sorted).transform("size").to_numpy()
+    end_sorted = np.minimum(idx_in_item + cfg.horizon, item_len - 1)
+
+    w_time = 0.5 ** ((d["date"].max() - d["date"]).dt.days.to_numpy(dtype=float)
+                     / max(cfg.half_life_days, 1))
+    w_uniq_sorted = average_uniqueness(end_sorted, items_sorted)
+    counts_sorted = grp.groupby(items_sorted).transform("size").to_numpy(dtype=float)
+
+    w_sorted = w_time[order] * w_uniq_sorted * (1.0 / np.sqrt(np.maximum(counts_sorted, 1.0)))
+
+    w = np.empty(n, dtype=float)
+    w[order] = w_sorted
     w[~np.isfinite(w) | (w <= 0)] = 1e-6
     return w / w.mean()

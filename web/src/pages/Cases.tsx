@@ -63,7 +63,7 @@ export default function Cases() {
                   </td>
                   <td className="num">{money(c.case_price)}</td>
                   <td className="num">{int(c.case_volume_30d)}</td>
-                  <td className="num">{pct(c.supply_growth_30d, 2)}</td>
+                  <td className="num">{num(c.supply_growth_30d, 2)}</td>
                   <td>
                     <span className={`tag ${c.drop_pool === 'removed' ? 't-good' : c.drop_pool === 'active' ? 't-warn' : 't-mute'}`}>
                       {c.drop_pool ?? '—'}

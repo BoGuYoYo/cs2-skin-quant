@@ -20,6 +20,44 @@ def drop_duration(price: pd.Series, win: int = 30) -> pd.Series:
     return under.groupby((under == 0).cumsum()).cumsum()
 
 
+def densify_calendar(
+    df: pd.DataFrame,
+    item_col: str = "item_id",
+    date_col: str = "date",
+    max_fill: int = 1,
+) -> pd.DataFrame:
+    """把每个品种补齐到连续日历，让后续 shift(n) / diff(n) 真正等于 n 个日历天。
+
+    为什么必须做：
+        原先 ret_21d = logp.diff(21)、y = shift(-21) 都是**行位移**。
+        只要中间漏采一天，「21 日收益」实际跨了 22 个日历天；
+        回测里按日期做的训练/测试隔离也随之不可靠。
+        实测数据里确实存在缺口（例如 10-09 → 10-11 缺 10-10）。
+
+    为什么只填 max_fill 天：
+        连续缺失超过 max_fill 说明该品种长期没采到，ffill 出一长串假价格
+        比留缺口更有害。长缺口保持 NaN，交给下游 dropna / is_warm 过滤。
+    """
+    if df.empty:
+        return df
+    parts: list[pd.DataFrame] = []
+    for item, g in df.groupby(item_col, sort=False):
+        g = g.sort_values(date_col)
+        if len(g) < 2:
+            parts.append(g)
+            continue
+        full_idx = pd.date_range(g[date_col].iloc[0], g[date_col].iloc[-1], freq="D")
+        if len(full_idx) == len(g):
+            parts.append(g)          # 无缺口，快路径直接返回
+            continue
+        gg = g.set_index(date_col).reindex(full_idx).ffill(limit=max_fill)
+        gg[item_col] = item
+        gg.index.name = date_col
+        parts.append(gg.reset_index())
+    out = pd.concat(parts, ignore_index=True)
+    return out.sort_values([item_col, date_col]).reset_index(drop=True)
+
+
 def build(
     hist: pd.DataFrame,
     case_df: pd.DataFrame | None = None,
@@ -36,6 +74,10 @@ def build(
     df = hist.sort_values(["item_id", "date"]).copy()
     if df.empty:
         return df
+
+    # 先稠密化日历：补掉单日缺口，让后续所有 diff / rolling / shift
+    # 真正等于「N 个日历天」，而不是「N 条记录」
+    df = densify_calendar(df)
     g = df.groupby("item_id", group_keys=False)
 
     # ---------------------------------------------------------- 价格形态
@@ -76,9 +118,18 @@ def build(
             df[col] = default
     df["case_rarity_score"] = df["rarity_score"].fillna(50.0)
 
-    # 供给刚性合成：箱子稀有（高）+ 存世增速低 → 供给接近饱和
-    growth = df["supply_growth_30d"].fillna(3.0).clip(lower=0)
-    df["supply_rigidity"] = (df["case_rarity_score"] / 100.0) * (1.0 - np.tanh(growth / 5.0))
+    # 供给刚性合成：箱子稀有（高）+ 存世量增速低 → 供给接近饱和
+    #
+    # 理想公式需要「存世量增速」，但 SteamDT 所有接口都不提供该字段，
+    # cases_build 现在诚实地置 None（早先塞的是箱子价格涨幅，语义错误）。
+    # 所以这里做条件退化：有真实增速时用完整公式，没有时只保留稀有度分量。
+    # 退化成 rarity/100 后与 case_rarity_score 共线，但语义正确、值域仍是 0-1，
+    # 模型自己会处理共线性 —— 比用一个假数据算出的"刚性"要诚实得多。
+    if df["supply_growth_30d"].notna().any():
+        growth = df["supply_growth_30d"].fillna(3.0).clip(lower=0)
+        df["supply_rigidity"] = (df["case_rarity_score"] / 100.0) * (1.0 - np.tanh(growth / 5.0))
+    else:
+        df["supply_rigidity"] = df["case_rarity_score"] / 100.0
 
     # ---------------------------------------------------------- 相对强度
     if index_df is not None and not index_df.empty:
@@ -120,6 +171,22 @@ def build(
                      event_conf_max=("confidence", "max"))
                 .reset_index()
             )
+
+            # 先把事件表铺满「事件起始日 → 行情最后一天」的连续日历，再做 30 日滚动。
+            # 踩过的坑：groupby 后 agg 只含**有事件的日期**，滚动也只是在这些日子上滑，
+            # 于是最后一次事件之后的所有日期都拿不到计数
+            # —— 实测 1/02 计 1，1/03 立刻变 0，而不是保留 30 天。
+            span_end = max(agg["date"].max(), df["date"].max())
+            full_range = pd.date_range(agg["date"].min(), span_end, freq="D")
+            agg = (
+                agg.set_index("date")
+                .reindex(full_range)
+                .fillna({"event_bearish_30d": 0.0, "event_bullish_30d": 0.0, "event_conf_max": 0.0})
+                .reset_index()
+                .rename(columns={"index": "date"})
+            )
+            agg.columns = ["date", "event_bearish_30d", "event_bullish_30d", "event_conf_max"]
+
             agg["event_bearish_30d"] = agg["event_bearish_30d"].rolling(30, min_periods=1).sum()
             agg["event_bullish_30d"] = agg["event_bullish_30d"].rolling(30, min_periods=1).sum()
             agg["event_conf_max"] = agg["event_conf_max"].rolling(30, min_periods=1).max()

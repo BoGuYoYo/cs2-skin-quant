@@ -201,15 +201,24 @@ def build(con: sqlite3.Connection) -> tuple[list[dict], dict[str, str], dict[str
         score, why = rarity_score(case_price, age_years, item_median, trend)
         pool = infer_drop_pool(case_price, age_years)
 
+        # 价格趋势写进 rationale（它是稀缺度的辅助信号，已计入 rarity_score），
+        # 但**不要**塞进 supply_growth_30d。
+        # 踩过的坑：这里原先把 trend*100 写进 supply_growth_30d，
+        # 而下游 features.supply_rigidity 把它当「存世量增速%」代入 tanh(growth/5)，
+        # 前端也把它显示成「存世量增速」—— 箱子涨价 30% 被解释成存世量增加 30%，
+        # 语义完全错误，且会随 features 修复直接污染模型。
+        trend_note = f"｜箱价30日 {trend * 100:+.1f}%" if trend is not None else ""
+
         out.append({
             "case_id": mhn,
             "case_name": c.get("name") or mhn,
             "rarity_score": score,
             "case_price": round(case_price, 2) if case_price else None,
-            "case_volume_30d": None,          # 需要 Steam 市场成交量，当前网络拿不到
-            "supply_growth_30d": round((trend or 0) * 100, 2) if trend is not None else None,
+            # 以下两个需要外部数据源，拿不到就留空 —— 不用近似值冒充
+            "case_volume_30d": None,      # Steam 市场成交量（开箱量代理），服务器访问不了 steamcommunity.com
+            "supply_growth_30d": None,    # 真实存世量增速，SteamDT 所有接口都不提供
             "drop_pool": pool,
-            "rationale": "；".join(why) + f"｜覆盖 {len(ids)} 个在库物品",
+            "rationale": "；".join(why) + trend_note + f"｜覆盖 {len(ids)} 个在库物品",
             "blocking_risk": (
                 "仍在掉落池，新增供给会持续压制价格" if pool == "active"
                 else "掉落池状态未知，需人工确认" if pool == "unknown"

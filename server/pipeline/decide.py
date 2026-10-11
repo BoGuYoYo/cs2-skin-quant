@@ -58,8 +58,12 @@ def detect_anomaly(row: dict[str, Any], cfg: Cfg) -> tuple[str | None, float, st
     if volume is not None and not _nan(volume) and volume < cfg.gate_volume:
         return None, score, "; ".join(why + ["流动性不足(无成交)"])
 
+    # 必须从最高等级往下匹配。
+    # 踩过的坑：原先是按 cfg.levels 的正序（L1 → L2 → L3）遍历并 break，
+    # 于是任何超过 L1 阈值的暴跌都先命中 L1 就退出了 —— 跌 62.8% 也只报 L1。
+    # 而 run_daily 只对 L3 发单品通知，结果线上 1253 条告警没有一条能触发推送。
     level = None
-    for lv, drop_th, z_th, _cd in cfg.levels:
+    for lv, drop_th, z_th, _cd in reversed(cfg.levels):
         ok_drop = r21 is not None and not _nan(r21) and r21 <= math.log1p(drop_th / 100.0)
         ok_z = z is not None and not _nan(z) and z <= -z_th
         if ok_drop and (ok_z or score >= 55):

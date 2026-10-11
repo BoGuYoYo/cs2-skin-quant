@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -91,14 +92,14 @@ def load_or_train(cfg: Cfg, labeled: pd.DataFrame) -> tuple[QuantileModel, CQR, 
     if not need_train:
         mdl = QuantileModel.load(cfg.model_path)
     else:
-        train_part, calib_part = _split_tail(mature, 0.8)
+        train_part, calib_part = _split_tail(mature, 0.8, cfg.horizon)
         w = labels.sample_weights(train_part, cfg)
         log.info("训练：%d 行 × %d 特征", len(train_part), len(FEATURE_COLS))
         mdl = model_train(train_part, w, cfg)
         mdl.save(cfg.model_path)
 
     # ---- CQR 校准：永远用「训练段之后的独立窗口」----
-    train_part, calib_part = _split_tail(mature, 0.8)
+    train_part, calib_part = _split_tail(mature, 0.8, cfg.horizon)
     if len(calib_part) >= 50:
         P = mdl.predict(calib_part[FEATURE_COLS])
         taus = sorted(cfg.quantiles)
@@ -119,10 +120,24 @@ def model_train(train_part: pd.DataFrame, w: np.ndarray, cfg: Cfg) -> QuantileMo
     return train_all(train_part[FEATURE_COLS], train_part["y"], w, cfg)
 
 
-def _split_tail(df: pd.DataFrame, frac: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _split_tail(df: pd.DataFrame, frac: float, horizon: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """按**日期**切分训练段与校准段，并 purge 掉标签跨越切分点的样本。
+
+    为什么不能按行数切（原先的 d.iloc[:cut] / d.iloc[cut:]）：
+      1) 同一天的所有品种会被切到两边，而横截面样本彼此高度相关
+      2) 更严重的是标签泄漏：训练段最后一天的 21 日前向收益会用到校准期的价格，
+         于是校准集不再是独立窗口，CQR 的覆盖率保证形同虚设
+
+    做法：训练集只保留「切分日 - horizon」之前的数据，确保其标签完全落在校准期开始之前。
+    """
     d = df.sort_values("date").reset_index(drop=True)
-    cut = int(len(d) * frac)
-    return d.iloc[:cut], d.iloc[cut:]
+    if d.empty:
+        return d, d
+    cut_idx = min(max(int(len(d) * frac), 1), len(d) - 1)
+    cut_date = d["date"].iloc[cut_idx]
+    train = d[d["date"] <= cut_date - pd.Timedelta(days=horizon)]
+    calib = d[d["date"] >= cut_date]
+    return train, calib
 
 
 def _push_cold_start(con, cfg: Cfg, day: str, now_ts: int, hist, reason: str) -> None:
@@ -279,7 +294,26 @@ def run(dry_run: bool = False, backtest_only: bool = False) -> int:
 
     # 概率校准：用 P50 是否为正 + 分位宽度做单调映射（真实项目里应训一个分类器）
     width = np.maximum(q_hi_adj - q_lo_adj, 1e-6)
-    prob_up = np.clip((P[:, 1] + 0.05) / 0.25, 0.0, 1.0)
+    # 「未来 21 日收益 ≥ +10%」的概率。
+    #
+    # 踩过的坑：原先写的是 np.clip((P50 + 0.05) / 0.25, 0, 1) —— 对中位数做线性裁剪，
+    # 于是 P50=0.20 就显示成「反弹概率 100%」，即使下分位还在严重亏损。
+    # 它既不是概率、也没经过校准，却在前端叫「反弹概率」并参与综合评分。
+    #
+    # 现在改为用分位数反推分布：正态假设下 P10/P90 对应 ±1.2816σ，
+    # 于是 σ = (P90 - P10) / (2 × 1.2816)，再算 P(X ≥ log(1.10))。
+    # 这仍然依赖正态假设（不是校准过的概率），但至少用上了分布宽度，
+    # 而且下分位很差时结果会自然变小。
+    _REBOUND_TARGET = math.log(1.10)
+
+    def _norm_cdf(x: float) -> float:
+        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+    _sigma = np.maximum((P[:, 2] - P[:, 0]) / (2.0 * 1.2816), 1e-6)
+    prob_up = np.array([
+        1.0 - _norm_cdf((_REBOUND_TARGET - float(p50)) / float(s))
+        for p50, s in zip(P[:, 1], _sigma)
+    ])
 
     candidates: list[dict[str, Any]] = []
     for i, (_, r) in enumerate(latest.iterrows()):
@@ -380,6 +414,17 @@ def run(dry_run: bool = False, backtest_only: bool = False) -> int:
         for c in cases_mod.load_cases(con)
     ]
 
+    # alerts 是自增主键，同一天重跑会不断叠加（实测演示数据里同一条 L3 出现了 3 次）。
+    # 日线策略一天一份快照，所以推送前先清掉当天的旧记录。
+    try:
+        day_start = int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+        n_del = con.execute("DELETE FROM alerts WHERE ts >= ?", (day_start,)).rowcount
+        con.commit()
+        if n_del:
+            log.info("清理今日旧告警 %d 条（同日重跑不叠加）", n_del)
+    except Exception as e:
+        log.warning("清理旧告警失败：%s", e)
+
     log.info("推送通道：%s", dispatch.describe())
     try:
         for stage, rows, kw in [
@@ -417,9 +462,20 @@ def run(dry_run: bool = False, backtest_only: bool = False) -> int:
     # ---------------- 7. 通知 ----------------
     if candidates:
         notify.notify_digest(day, candidates, fails or None)
+
+    # 告警通知：带上真实现价（原先写死 0.0，推送到手机上永远是「现价 ¥0.00」）
+    price_by_item = {
+        r["item_id"]: r["price"]
+        for r in factor_rows
+        if r.get("item_id") and r.get("price") is not None
+    }
     for a in alert_rows[:5]:
         if a["level"] == "L3":
-            notify.notify_item(a["name"] or a["item_id"], a["level"], 0.0, a["detail"] or "")
+            notify.notify_item(
+                a["name"] or a["item_id"], a["level"],
+                float(price_by_item.get(a["item_id"]) or 0.0),
+                a["detail"] or "",
+            )
 
     _print_top(candidates)
     return 0 if not fails else 6

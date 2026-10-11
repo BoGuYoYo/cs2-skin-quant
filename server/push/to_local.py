@@ -149,6 +149,24 @@ def _coerce(v: Any) -> Any:
     return v
 
 
+#: 各表主键。用于生成 UPSERT（冲突时只更新本次真正提供的列）。
+#: 空列表表示自增主键、不做冲突处理，直接 INSERT。
+_PK: dict[str, list[str]] = {
+    "items": ["item_id"],
+    "case_meta": ["case_id"],
+    "snap_daily": ["item_id", "date"],
+    "kline": ["item_id", "date"],
+    "forecast": ["item_id", "date"],
+    "factor_latest": ["item_id"],
+    "market_index": ["date"],
+    "backtest": ["date"],
+    "meta": ["k"],
+    "task_progress": ["task"],
+    "alerts": [],
+    "runs": [],
+}
+
+
 def push(
     stage: str,
     rows: Sequence[dict[str, Any]] | Iterable[dict[str, Any]],
@@ -165,6 +183,17 @@ def push(
     if not rows:
         return 0
 
+    # 只写「本次真正提供的列」。
+    # 踩过的坑：原先固定用全部列 + INSERT OR REPLACE，而 REPLACE 的语义是
+    # 「删行再插入」，于是 progress.report 只传 task/status/updated_at 时，
+    # total/done/ok/rows/started_at 会被一并清成 NULL —— 前端进度条中途跳变。
+    present = [c for c in cols if any(c in r and r[c] is not None for r in rows)]
+    if not present:
+        return 0
+
+    pk = [c for c in _PK.get(stage, []) if c in present]
+    use_upsert = bool(pk) and len(pk) == len(_PK.get(stage, []))
+
     con = connect()
     try:
         changed = 0
@@ -175,9 +204,20 @@ def push(
             cur = con.execute(f"DELETE FROM {stage} WHERE item_id = ?", (replace_series,))
             changed += cur.rowcount or 0
 
-        ph = ",".join(["?"] * len(cols))
-        sql = f"INSERT OR REPLACE INTO {stage} ({','.join(cols)}) VALUES ({ph})"
-        payload = [[_coerce(r.get(c)) for c in cols] for r in rows]
+        ph = ",".join(["?"] * len(present))
+        if use_upsert:
+            updates = ",".join(f"{c}=COALESCE(excluded.{c}, {stage}.{c})" for c in present if c not in pk)
+            sql = (
+                f"INSERT INTO {stage} ({','.join(present)}) VALUES ({ph}) "
+                f"ON CONFLICT({','.join(pk)}) DO UPDATE SET {updates}"
+                if updates else
+                f"INSERT OR IGNORE INTO {stage} ({','.join(present)}) VALUES ({ph})"
+            )
+        else:
+            # 自增主键表（alerts / runs）没有可冲突的唯一键，直接插入
+            sql = f"INSERT INTO {stage} ({','.join(present)}) VALUES ({ph})"
+
+        payload = [[_coerce(r.get(c)) for c in present] for r in rows]
 
         # 回填/采集进程会长时间持有写锁，这里退避重试而不是直接失败
         import time as _time

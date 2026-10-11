@@ -166,7 +166,10 @@ def purged_wf_splits(
     if len(uniq) < n_splits * 3:
         return
     edges = np.array_split(np.arange(len(uniq)), n_splits + 1)
-    for i in range(1, len(edges) - 1):
+    # range 要走到 len(edges) 而不是 len(edges)-1。
+    # 踩过的坑：原先写 range(1, len(edges) - 1)，最后一段（约 1/(n_splits+1) 的时间）
+    # 永远不会成为测试集 —— 最近行情从未被验证过。
+    for i in range(1, len(edges)):
         test_days = uniq[edges[i]]
         cut = test_days[0] - np.timedelta64(horizon + embargo, "D")
         tr = np.flatnonzero(d <= cut)
@@ -177,7 +180,12 @@ def purged_wf_splits(
 
 
 def walk_forward(df: pd.DataFrame, cfg: Cfg) -> tuple[pd.DataFrame, dict[str, float]]:
-    """返回 (逐折指标, 无条件基线指标)。打不过基线就说明特征没有信息量。"""
+    """返回 (逐折指标, 无条件基线指标)。打不过基线就说明特征没有信息量。
+
+    基线的算法很关键：**每折都用该折训练集自己的分位数**，而不是全样本分位数。
+    踩过的坑：原先用 np.quantile(全样本)，等于把测试期的标签信息泄漏进基线，
+    基线偏乐观，于是 8% 的改善门槛是拿一个虚高的参照物在比。
+    """
     from .labels import sample_weights
 
     d = df.dropna(subset=["y"]).sort_values("date").reset_index(drop=True)
@@ -186,7 +194,10 @@ def walk_forward(df: pd.DataFrame, cfg: Cfg) -> tuple[pd.DataFrame, dict[str, fl
     if d.empty:
         return pd.DataFrame(), {}
 
+    taus = sorted(cfg.quantiles)
     rows: list[dict[str, Any]] = []
+    base_rows: list[dict[str, float]] = []
+
     for fold, (tr, te) in enumerate(purged_wf_splits(d["date"], cfg.n_splits, cfg.horizon, cfg.embargo)):
         trd, ted = d.iloc[tr], d.iloc[te]
         if len(trd) < 300 or len(ted) < 30:
@@ -194,12 +205,28 @@ def walk_forward(df: pd.DataFrame, cfg: Cfg) -> tuple[pd.DataFrame, dict[str, fl
         w = sample_weights(trd, cfg)
         mdl = train_all(trd[FEATURE_COLS], trd["y"], w, cfg)
         P = mdl.predict(ted[FEATURE_COLS])
+
         rec: dict[str, Any] = {"fold": fold, "n_train": len(trd), "n_test": len(ted)}
+        base_rec: dict[str, float] = {}
         ya = ted["y"].to_numpy()
-        for k, tau in enumerate(sorted(cfg.quantiles)):
+        y_tr = trd["y"].to_numpy()
+
+        for k, tau in enumerate(taus):
             rec[f"pinball_{tau}"] = pinball(ya, P[:, k], tau)
             rec[f"cover_{tau}"] = float((ya <= P[:, k]).mean())
+            # 该折的无条件基线：只用训练集的分位数，不看测试期
+            q = float(np.quantile(y_tr, tau))
+            base_rec[f"pinball_{tau}"] = pinball(ya, np.full_like(ya, q), tau)
+
         rows.append(rec)
+        base_rows.append(base_rec)
+
+    # 基线按折平均，与模型指标口径一致（都是逐折、都只用训练集信息）
+    base = (
+        {k: float(np.mean([b[k] for b in base_rows])) for k in base_rows[0]}
+        if base_rows else {}
+    )
+    return pd.DataFrame(rows), base
 
     y_all = d["y"].to_numpy()
     base = {

@@ -4,7 +4,7 @@ import { api } from '../lib/api';
 import { useApi } from '../lib/useApi';
 import { CandidateTable } from '../components/CandidateTable';
 import { State } from '../components/State';
-import { int, money, pct, num, rarityTone } from '../lib/format';
+import { int, money, pct, num, logPct, rarityTone } from '../lib/format';
 
 type Mode = 'pool' | 'screener';
 
@@ -155,7 +155,7 @@ export default function Candidates() {
                     <td className="num">{money(r.price)}</td>
                     <td className="num neg">{pct(r.dd_from_high, 1)}</td>
                     <td className="num">{r.drop_duration_days ?? '—'}</td>
-                    <td className={`num ${(r.ret_21d ?? 0) < 0 ? 'neg' : 'pos'}`}>{pct(r.ret_21d, 1)}</td>
+                    <td className={`num ${(r.ret_21d ?? 0) < 0 ? 'neg' : 'pos'}`}>{logPct(r.ret_21d, 1)}</td>
                     <td className="num">{pct(r.turnover, 2)}</td>
                     <td className="num">{pct(r.list_ratio, 2)}</td>
                     <td className="num">{pct(r.supply_peer_pct, 0)}</td>

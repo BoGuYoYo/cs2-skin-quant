@@ -8,7 +8,7 @@ import { CandidateTable } from '../components/CandidateTable';
 import { State } from '../components/State';
 import { ProgressPanel } from '../components/ProgressPanel';
 import { DraggablePanel } from '../components/DraggablePanel';
-import { int, levelTone, pct, relTime } from '../lib/format';
+import { int, levelTone, logPct, pct, relTime } from '../lib/format';
 
 /** 面板顺序可拖拽调整，存 localStorage */
 const DEFAULT_ORDER = ['progress', 'candidates', 'market', 'backtest', 'alerts'];
@@ -77,7 +77,7 @@ export default function Dashboard() {
         />
         {btLast && (
           <p className="ark-dim ark-mono" style={{ fontSize: 11, marginTop: 8 }}>
-            样本 {int(btLast.n)} · 胜率 {pct(btLast.win_rate, 0)} · 最新周期 {pct(btLast.mean_21d, 2)}
+            样本 {int(btLast.n)} · 胜率 {pct(btLast.win_rate, 0)} · 最新周期 {logPct(btLast.mean_21d, 2)}
           </p>
         )}
       </State>,
@@ -165,7 +165,7 @@ export default function Dashboard() {
             <div className="l">覆盖武器箱</div>
           </div>
           <div className="ark-stat">
-            <div className="v">{btLast ? pct(btLast.cum, 1) : '—'}</div>
+            <div className="v">{btLast ? logPct(btLast.cum, 1) : '—'}</div>
             <div className="l">回测累计净收益</div>
           </div>
         </div>

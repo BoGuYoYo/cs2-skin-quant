@@ -55,7 +55,7 @@ export function CandidateTable({ rows, compact = false, sortKey, onSort }: Props
             {th('q10', 'P10', 'num')}
             {th('score', 'P50', 'num')}
             <th className="num">P90</th>
-            <th className="num">反弹概率</th>
+            <th className="num">反弹≥10%</th>
             <th className="num">仓位</th>
             <th>判断</th>
             {!compact && <th>依据</th>}

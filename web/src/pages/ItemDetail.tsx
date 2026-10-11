@@ -19,13 +19,34 @@ import {
   windowFit,
 } from '../lib/format';
 
-function FactorRow({ label, value, unit = 'num', hint }: { label: string; value: number | null; unit?: 'num' | 'pct'; hint?: string }) {
-  const shown = unit === 'pct' ? pct(value, 2) : num(value, 2);
+/**
+ * unit 语义（必须与后端量纲对齐，否则会出现 3000% 这种错值）：
+ *   'num'    裸数值（已经是百分数的字段也用它）
+ *   'pct'    普通比率，如 0.18 → 18%
+ *   'logpct' 对数收益，需要 expm1 还原，如 0.182 → 20%
+ *
+ * 踩过的坑：后端 list_slope_7d 已经是 pct_change(7)*100、supply_growth_30d
+ * 也已经是百分数，前端再乘一次 100 就变成 3000%；而 ret_7d/21d/30d 与
+ * rel_ret_21d 是对数收益，直接用 pct() 会把「跌 50%」显示成「-69.3%」。
+ */
+function FactorRow({
+  label,
+  value,
+  unit = 'num',
+  hint,
+}: {
+  label: string;
+  value: number | null;
+  unit?: 'num' | 'pct' | 'logpct';
+  hint?: string;
+}) {
+  const shown = unit === 'pct' ? pct(value, 2) : unit === 'logpct' ? logPct(value, 2) : num(value, 2);
+  const scale = unit === 'pct' ? 100 : unit === 'logpct' ? 100 : 20;
   return (
     <div className="factor-row">
       <span className="lab">{label}</span>
       <span className="bar">
-        <i style={{ width: `${Math.min(100, Math.abs((value ?? 0) * (unit === 'pct' ? 100 : 20)))}%` }} />
+        <i style={{ width: `${Math.min(100, Math.abs((value ?? 0) * scale))}%` }} />
       </span>
       <span className="val">{shown}</span>
       {hint ? <span className="dim" style={{ gridColumn: '1 / -1', fontSize: 11 }}>{hint}</span> : null}
@@ -74,7 +95,7 @@ export default function ItemDetail() {
           <div className="dim" style={{ fontSize: 12 }}>
             30日回撤 <span className="neg">{pct(f?.dd_from_high, 1)}</span>
             {' · '}
-            相对大盘 21日 {pct(f?.rel_ret_21d, 1)}
+            相对大盘 21日 {logPct(f?.rel_ret_21d, 1)}
           </div>
         </div>
       </div>
@@ -86,7 +107,7 @@ export default function ItemDetail() {
             <QuantileBand q10={fc?.q10_adj ?? null} q50={fc?.q50 ?? null} q90={fc?.q90_adj ?? null} />
             <div className="grid g3" style={{ marginTop: 14 }}>
               <div>
-                <div className="dim" style={{ fontSize: 12 }}>反弹概率（≥10%）</div>
+                <div className="dim" style={{ fontSize: 12 }}>反弹≥10% 概率（模型估计）</div>
                 <div className="mono" style={{ fontSize: 18 }}>{fc?.prob_up === null || fc?.prob_up === undefined ? '—' : pct(fc.prob_up, 0)}</div>
               </div>
               <div>
@@ -117,7 +138,7 @@ export default function ItemDetail() {
             </div>
             <div>
               <div className="dim" style={{ fontSize: 12 }}>存世量 30 日增速</div>
-              <div className="mono" style={{ fontSize: 14 }}>{pct(cm?.supply_growth_30d, 2)}</div>
+              <div className="mono" style={{ fontSize: 14 }}>{num(cm?.supply_growth_30d, 2)}</div>
             </div>
             <div>
               <div className="dim" style={{ fontSize: 12 }}>掉落池</div>
@@ -129,7 +150,7 @@ export default function ItemDetail() {
             <FactorRow label="供给刚性（合成）" value={f?.supply_rigidity ?? null} />
             <FactorRow label="换手率" value={f?.turnover ?? null} unit="pct" />
             <FactorRow label="在售 / 存世" value={f?.list_ratio ?? null} unit="pct" />
-            <FactorRow label="挂单量 7 日变化" value={f?.list_slope_7d ?? null} unit="pct" />
+            <FactorRow label="挂单量 7 日变化" value={f?.list_slope_7d ?? null} />
           </div>
           {cm?.rationale ? (
             <div className="ark-note" style={{ marginTop: 12, marginBottom: 0 }}>
@@ -165,9 +186,9 @@ export default function ItemDetail() {
       <div className="grid g2">
         <div className="ark-panel">
           <h3>动量与波动</h3>
-          <FactorRow label="7 日收益" value={f?.ret_7d ?? null} unit="pct" />
-          <FactorRow label="21 日收益" value={f?.ret_21d ?? null} unit="pct" />
-          <FactorRow label="30 日收益" value={f?.ret_30d ?? null} unit="pct" />
+          <FactorRow label="7 日收益" value={f?.ret_7d ?? null} unit="logpct" />
+          <FactorRow label="21 日收益" value={f?.ret_21d ?? null} unit="logpct" />
+          <FactorRow label="30 日收益" value={f?.ret_30d ?? null} unit="logpct" />
           <FactorRow label="21 日波动率" value={f?.vol_21 ?? null} unit="pct" />
           <div className="grid g2" style={{ marginTop: 12 }}>
             <div>
