@@ -17,8 +17,10 @@ ExecStart=/opt/skin-alpha/server/.venv/bin/python -m pipeline.run_daily
 StandardOutput=append:/var/log/skin-alpha/daily.log
 StandardError=append:/var/log/skin-alpha/daily.log
 
-# 采集 2000 品种要等 20 分钟限流，留足超时
-TimeoutStartSec=3600
+# 超时：全池 8417 个品种 × 0.6s ≈ 84 分钟采集 + 约 10 分钟特征/训练/预测。
+# 必须留足 —— 超时被 SIGTERM 掉的话，采集写了一部分、特征还没算，
+# 当天就没有新预测，而且日志看起来"跑过"。给 4 小时。
+TimeoutStartSec=14400
 Restart=no
 
 # 加固：无特权提升、独立临时目录

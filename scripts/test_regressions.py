@@ -372,11 +372,23 @@ def test_liquidity_gate_missing_data() -> None:
 
 
 def test_update_schedule_is_7am_beijing() -> None:
-    """用户规则：早上七点左右开始更新（2026-10-11）。"""
-    print("\n[13] 更新时间：北京 07:00")
-    timer = (Path(__file__).resolve().parent / "skin-alpha-daily.timer").read_text(encoding="utf-8")
-    check("OnCalendar 是 UTC 23:00（= 北京 07:00）", "23:00:00 UTC" in timer)
+    """用户规则：早上七点左右开始更新（2026-10-11）；晚 19:00 再刷新一次。"""
+    print("\n[13] 更新时间：北京 07:00 全量 + 19:00 增量")
+    here = Path(__file__).resolve().parent
+    timer = (here / "skin-alpha-daily.timer").read_text(encoding="utf-8")
+    check("早上那次 OnCalendar 是 UTC 23:00（= 北京 07:00）", "23:00:00 UTC" in timer)
     check("开机补跑仍开启", "Persistent=true" in timer)
+
+    rtimer = (here / "skin-alpha-refresh.timer").read_text(encoding="utf-8")
+    check("晚间那次 OnCalendar 是 UTC 11:00（= 北京 19:00）", "11:00:00 UTC" in rtimer)
+    check("晚间那次开机也补跑", "Persistent=true" in rtimer)
+    rsvc = (here / "skin-alpha-refresh.service").read_text(encoding="utf-8")
+    check("晚间那次跳过采集（--skip-collect）", "--skip-collect" in rsvc)
+    check("晚间那次用的是独立的 refresh.log", "refresh.log" in rsvc)
+
+    dsvc = (here / "skin-alpha-daily.service").read_text(encoding="utf-8")
+    check("全量那次的超时够跑完 84 分钟采集 + 训练", "TimeoutStartSec=14400" in dsvc,
+          "超时设小了会在采集之后、特征之前被 SIGTERM，当天直接没有新预测")
 
 
 def test_weapon_exclusion_sql() -> None:

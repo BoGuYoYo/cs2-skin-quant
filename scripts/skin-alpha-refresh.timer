@@ -1,0 +1,21 @@
+[Unit]
+Description=Run skin-alpha refresh daily at 11:00 UTC (19:00 Beijing)
+Documentation=https://github.com/BoGuYoYo/cs2-skin-quant
+
+[Timer]
+# UTC 11:00 = 北京时间 19:00 —— 当天第二次更新。
+# 想改时间就改这一行（UTC = 北京 - 8h）：比如北京 21:00 → 13:00:00 UTC。
+# 想加第三次：复制本文件改个单元名再 enable 一次即可（互不冲突，
+# 因为同日重跑是幂等的：forecast 按 (item_id, date) 覆盖，
+# 告警会先清掉今天的旧行再写，不会叠加）。
+OnCalendar=*-*-* 11:00:00 UTC
+Unit=skin-alpha-refresh.service
+
+# 关机错过就开机补跑一次
+Persistent=true
+
+# 随机延迟，避开整点
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

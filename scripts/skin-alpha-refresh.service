@@ -1,0 +1,53 @@
+# /etc/systemd/system/skin-alpha-refresh.service
+#
+# 当天的第二次刷新（晚上那一次）—— 只重算，不重采历史。
+#
+#   sudo cp scripts/skin-alpha-refresh.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now skin-alpha-refresh.timer
+#
+# 为什么不跟早上那次一样全量跑：
+#   /open/cs2/item/v1/kline 每次都返回**整段 365 天历史**，而一天里真正新增的
+#   只有「今天这根还没封口的日线」。为了这一根线去重拉 8417 × 365 行
+#   （约 84 分钟、300 万次 UPSERT）是纯粹的浪费。
+#
+#   而价格其实已经被另一个服务持续刷新了：
+#   skin-alpha-listings（挂单量采集）每轮 100 个品种、一轮 84 分钟，
+#   它写的是同一张 snap 表的 sell / bid / listings 三列 ——
+#   所以到晚上 19:00，全池价格已经是 1.5 小时内的新鲜值。
+#   于是这次只需要「读历史 → 算特征 → 重新预测」（约 10 分钟）。
+#
+# 分工总结：
+#   07:00 skin-alpha-daily   全量：拉 K 线、补漏采日期、重训（每 3 天）
+#   19:00 skin-alpha-refresh 增量：复用已有历史，用最新价格重新出预测
+#
+# 随时想加第三次/改时间：见 skin-alpha-refresh.timer 的 OnCalendar。
+
+[Unit]
+Description=skin-alpha refresh (晚间第二次预测，跳过采集)
+Documentation=https://github.com/BoGuYoYo/cs2-skin-quant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=huangzefa
+Group=huangzefa
+WorkingDirectory=/opt/skin-alpha/server
+EnvironmentFile=/opt/skin-alpha/server/.env
+
+# --skip-collect：复用库里已有历史。8417 个品种的采集要 84 分钟，
+# 而这次的目的只是「用新价格重新算一遍特征和预测」，10 分钟够。
+ExecStart=/opt/skin-alpha/server/.venv/bin/python -m pipeline.run_daily --skip-collect
+
+StandardOutput=append:/var/log/skin-alpha/refresh.log
+StandardError=append:/var/log/skin-alpha/refresh.log
+
+# 实测 9~12 分钟（4000 品种训练 + 8417 个品种推理）；留足余量防慢盘
+TimeoutStartSec=3600
+Restart=no
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
