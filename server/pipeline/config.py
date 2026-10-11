@@ -157,23 +157,44 @@ MONOTONE: dict[str, int] = {
 CFG = Cfg()
 
 # ---------------------------------------------------------------- 域筛选（用户规则）
-#: 用户在 2026-10-11 定的规则：「纪念品不看；StatTrak 不看」。
-#:
-#: 单独抽成常量是因为它要在**三个地方**同时生效，漏一处就会出现
-#: 「监控池里没有、候选页里还有」这种前后不一致：
-#:   1) 采集监控池（别浪费配额去拉它们）
-#:   2) 推理截面（不进 forecast / factor_latest）
-#:   3) 前端列表接口（历史行还在库里，查询时兜一层）
-#:
-#: 注意区分「不看」和「删掉」：`items` 表仍然是完整目录（44k 个品种），
-#: 推送也照旧全量 —— 直接搜某个 StatTrak 还是能搜到详情页。
-#: 被排除的是「推荐/筛选/监控」这三个口径，不是数据本身。
-#:
-#: 命名事实（别改成更"聪明"的匹配）：CS2 里 StatTrak 带 ™
-#: （"StatTrak™ AK-47 | Redline (Field-Tested)"），匕首是
-#: "★ StatTrak™ Karambit | ..."；纪念品是 "Souvenir ..." 前缀。
-#: '%StatTrak%' / '%Souvenir%' 全覆盖且不会误伤。
+#: 用户 2026-10-11 追加的规则：
+#:   1) 纪念品不看
+#:   2) StatTrak 不看
+#:   3) 内格夫、M249、贝瑞塔、CZ、SG553「等枪械」不看
+DOMAIN_EXCLUDE_WEAPONS: tuple[str, ...] = (
+    "Negev",          # 内格夫（机枪，盘口最薄）
+    "M249",           # M249（机枪）
+    "Dual Berettas",  # 双持贝瑞塔
+    "CZ75-Auto",      # CZ75 自动型（简称 CZ）
+    "SG 553",         # SG553
+)
+# 想再砍几把枪就往上面这个元组里加名字即可 —— 采集池 / 推理截面 /
+# 前端列表接口三处都会自动跟着变（见文件末尾 DOMAIN_EXCLUDE_SQL 的拼装）。
+#
+# 命名变体（实测，别凭印象）：
+#   普通       "Negev | Power Loader (Factory New)"   ← 前缀 ''
+#   StatTrak™  "StatTrak™ Negev | ..."                ← 前缀 'StatTrak™ '
+#   纪念品      "Souvenir Negev | ..."                 ← 前缀 'Souvenir '
+#   纯正        "Genuine P250 | ..."                   ← 前缀 'Genuine '（库里只有 1 条，是 P250）
+# 所以只匹配裸名是不够的，两种形态都得覆盖。
+
+
+def _weapon_exclude_sql(weapons: tuple[str, ...]) -> str:
+    """把枪名列表拼成排除条件。
+
+    ⚠️ 必须带 " | " 一起匹配，绝不能用裸子串：
+        'M4' 会顺手打掉 M4A4 / M4A1-S，'SSG'、'P90' 之类也有同样的坑。
+        带上 " | "（武器名与皮肤名之间的分隔符）就只剩精确语义了。
+    """
+    parts: list[str] = []
+    for w in weapons:
+        parts.append(f" AND market_hash_name NOT LIKE '{w} | %'")       # 裸名
+        parts.append(f" AND market_hash_name NOT LIKE '% {w} | %'")     # 带前缀（StatTrak™/Souvenir/Genuine）
+    return "".join(parts)
+
+
 DOMAIN_EXCLUDE_SQL = (
+    # 纪念品 / StatTrak：整类排除
     " AND market_hash_name NOT LIKE '%Souvenir%'"
     " AND market_hash_name NOT LIKE '%StatTrak%'"
-)
+) + _weapon_exclude_sql(DOMAIN_EXCLUDE_WEAPONS)

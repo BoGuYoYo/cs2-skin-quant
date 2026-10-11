@@ -23,7 +23,14 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from pipeline import collector, decide, features, labels  # noqa: E402
-from pipeline.config import CFG, FEATURE_COLS, FEATURE_COLS_PENDING, MONOTONE  # noqa: E402
+from pipeline.config import (  # noqa: E402
+    CFG,
+    DOMAIN_EXCLUDE_SQL,
+    DOMAIN_EXCLUDE_WEAPONS,
+    FEATURE_COLS,
+    FEATURE_COLS_PENDING,
+    MONOTONE,
+)
 
 FAIL: list[str] = []
 
@@ -372,6 +379,57 @@ def test_update_schedule_is_7am_beijing() -> None:
     check("开机补跑仍开启", "Persistent=true" in timer)
 
 
+def test_weapon_exclusion_sql() -> None:
+    """用户规则：内格夫 / M249 / 贝瑞塔 / CZ / SG553「等枪械」不看。
+
+    这条测试用**真实 SQL**（collector.WATCHLIST_SQL）在内存库里跑一遍，
+    因为最容易犯的错不是漏写规则，而是写法误伤：
+        'NOT LIKE %M4%' 会顺手打掉 M4A4 / M4A1-S；
+        'NOT LIKE Negev%'（不带 " | "）则会漏掉 'Souvenir Negev | ...' 这种带前缀的形态。
+    两种错都很隐蔽 —— 前者悄悄少赚，后者悄悄没生效。
+    """
+    print("\n[14] 枪械排除：内格夫 / M249 / 贝瑞塔 / CZ / SG553")
+    check("五把枪都在配置里",
+          set(DOMAIN_EXCLUDE_WEAPONS) == {"Negev", "M249", "Dual Berettas",
+                                          "CZ75-Auto", "SG 553"},
+          f"{DOMAIN_EXCLUDE_WEAPONS}")
+    check("匹配带上 ' | ' 分隔符（不用裸子串）", "Negev | %" in DOMAIN_EXCLUDE_SQL)
+
+    import sqlite3  # noqa: PLC0415
+
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE items (item_id TEXT, name TEXT, market_hash_name TEXT)")
+    # (market_hash_name, 是否应留在监控池)
+    samples = [
+        ("Negev | Power Loader (Factory New)", False),
+        ("M249 | Aztec (Minimal Wear)", False),
+        ("Dual Berettas | Melondrama (Factory New)", False),
+        ("CZ75-Auto | Tacticat (Well-Worn)", False),
+        ("SG 553 | Cyrex (Field-Tested)", False),
+        # 带前缀形态：即使哪天放开纪念品/StatTrak 也仍然要挡住
+        ("Souvenir Negev | Man-o'-war (Field-Tested)", False),
+        ("StatTrak™ M249 | Aztec (Minimal Wear)", False),
+        ("Genuine CZ75-Auto | X", False),
+        # 必须保留：同类名字最容易被误伤
+        ("M4A4 | 龙王 (Factory New)", True),
+        ("M4A1-S | Printstream (Field-Tested)", True),
+        ("AK-47 | Redline (Field-Tested)", True),
+        ("AWP | Asiimov (Field-Tested)", True),
+        ("SSG 08 | Fever Dream (Minimal Wear)", True),
+        ("Galil AR | Chatterbox (Well-Worn)", True),
+        ("MAC-10 | Neon Rider (Factory New)", True),
+    ]
+    for i, (mhn, _) in enumerate(samples):
+        con.execute("INSERT INTO items VALUES (?,?,?)", (mhn, mhn.split(" | ")[0], mhn))
+    kept = {r[0] for r in con.execute(collector.WATCHLIST_SQL).fetchall()}
+
+    missed = [m for m, keep in samples if not keep and m in kept]
+    killed = [m for m, keep in samples if keep and m not in kept]
+    check("五把枪（含带前缀形态）全部被排除", not missed, f"漏掉：{missed}")
+    check("没有误伤 M4A4 / M4A1-S / AK-47 / AWP / SSG 08 / Galil / MAC-10",
+          not killed, f"误杀：{killed}")
+
+
 def main() -> int:
     print("=" * 62)
     print("回归测试：每条对应一个真实踩过的坑")
@@ -387,6 +445,7 @@ def main() -> int:
     test_batch_rate_limit_detection()
     test_no_constant_features_when_inputs_present()
     test_domain_exclude_rules()
+    test_weapon_exclusion_sql()
     test_liquidity_gate_missing_data()
     test_update_schedule_is_7am_beijing()
     print("\n" + "=" * 62)
