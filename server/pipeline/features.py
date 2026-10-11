@@ -208,9 +208,19 @@ def build(
     )
 
     # 按品种前向填充，残余 NaN 归零 —— 保证推理阶段永远拿到完整向量。
-    # 注意：fillna 发生在 is_warm 计算之后，所以预热期样本仍会被标记为不可用。
+    # 注意 1：fillna 发生在 is_warm 计算之后，所以预热期样本仍会被标记为不可用。
+    # 注意 2：只填 FEATURE_COLS。FEATURE_COLS_PENDING 里的列**故意留 NaN**——
+    #   它们没有真实原料（存世量/成交量/挂单量/事件），填 0 会让前端把「没数据」
+    #   显示成「换手率 0.00%」，那正是我们要消灭的那种"看着像模像样"的假数据。
+    #   NaN 一路推到前端会渲染成 "—"，这才是诚实的。
     for c in FEATURE_COLS:
         df[c] = df.groupby("item_id")[c].ffill().fillna(0.0)
+
+    # float64 → float32：542 万行 × 38 列，光 dtype 就从 1.6GB 降到 0.8GB。
+    # 4G 内存的机器上这一步是能不能跑完的分界线（曾经被 OOM 杀掉）。
+    for c in df.columns:
+        if df[c].dtype == "float64":
+            df[c] = df[c].astype("float32")
     return df
 
 

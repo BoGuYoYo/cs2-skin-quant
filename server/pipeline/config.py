@@ -86,38 +86,66 @@ class Cfg:
     retrain_days: int = field(default_factory=lambda: _i("RETRAIN_DAYS", 3))
     model_version: str = field(default_factory=lambda: _env("MODEL_VERSION", "lgb-q-v1"))
 
+    # ---------------- 内存（4G 小机器上的硬约束）----------------
+    # 踩过的坑：回填把 snap 从 216 万行涨到 542 万行后，整条管线一次吃掉
+    # 3.1GB RSS + 2.1GB swap，被内核 OOM 直接杀掉 —— 日志里连 traceback 都没有，
+    # 看上去就像「跑到一半自己没了」。所以特征必须分块算，训练集必须抽样。
+    infer_days: int = field(default_factory=lambda: _i("INFER_DAYS", 120))
+    train_item_limit: int = field(default_factory=lambda: _i("TRAIN_ITEM_LIMIT", 4000))
+    feat_batch_items: int = field(default_factory=lambda: _i("FEAT_BATCH_ITEMS", 1500))
+
     def ensure_dirs(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
 
-# 特征列：顺序固定，训练与推理必须一致（模型按顺序对齐）
+# ---------------------------------------------------------------- 特征列
+#
+# 这里必须分成两份，而且是**按数据可得性**分，不是按重要性分。
+#
+# 为什么要这么较真：MONOTONE 会给列加单调约束，而常数列的约束是「假的」——
+# 它看起来在表达「换手率越高越好」，实际上那一列恒为 0，模型从没学到任何东西，
+# 只是我们误以为约束生效了。实测 23 列里有 10 列恒为常数。
+#
+# 纪律：没有真实原料的列，就**不要**放进 FEATURE_COLS。
+# 宁可少几列，不可假装有。
 FEATURE_COLS: list[str] = [
-    # 价格形态
+    # 价格形态（9 列：全部有真实原料）
     "ret_1d", "ret_7d", "ret_14d", "ret_21d", "ret_30d",
     "dd_from_high", "drop_duration_days",
     "vol_21", "vol_z",
-    # 供给面（核心：箱子稀有 + 存世饱和）
-    "supply_peer_pct", "case_rarity_score", "case_volume_30d",
-    "supply_growth_30d", "supply_rigidity",
-    # 需求与抛压
-    "turnover", "turnover_ma7", "list_ratio", "list_slope_7d",
-    # 相对强度
+    # 供给面：只有箱子稀有度这一条链路是活的（case_meta 驱动）
+    "case_rarity_score", "supply_rigidity",
+    # 相对强度：market_index 为空时 rel_ret_* 会退化成 ret_* 的副本（见下）
     "rel_ret_7d", "rel_ret_21d",
-    # LLM 事件
-    "event_bearish_30d", "event_bullish_30d", "event_conf_max",
 ]
 
-# 单调约束：把经验法则硬编码进模型，小样本下最有效的防过拟合手段
-MONOTONE: dict[str, int] = {
-    "case_rarity_score": 1,     # 箱子越稀有 → 未来收益越高
-    "case_volume_30d": -1,      # 开箱量越大 → 供给洪水 → 收益越低
-    "supply_growth_30d": -1,    # 存世增速越快 → 越差
-    "supply_rigidity": 1,       # 供给刚性 → 越好
-    "supply_peer_pct": -1,      # 存世量同箱分位越高（越不稀有）→ 越差
-    "turnover": 1,              # 换手越高 → 有需求 → 越好
-    "list_ratio": -1,           # 在售占比越高 → 抛压越重 → 越差
-    "list_slope_7d": -1,        # 挂单量增长 → 抛压 → 越差
-    "rel_ret_21d": 1,           # 强于大盘 → 越好
+#: 已声明、但**当前没有真实原料**的特征。
+#: 保留在这里是为了留下「缺什么、为什么不能拿近似值冒充」的记录，
+#: 免得下次有人看到 23 列变 13 列又顺手加回来。
+FEATURE_COLS_PENDING: dict[str, str] = {
+    "supply_peer_pct": "需 snap.supply（存世量同箱分位）—— Steam 不公开存世量，SteamDT 无接口",
+    "case_volume_30d": "需箱子成交量 —— 服务器访问不了 steamcommunity.com",
+    "supply_growth_30d": "需存世量增速 —— 相对量也拿不到；绝不能拿箱价涨幅冒充（踩过一次）",
+    "turnover": "需 volume ÷ supply —— 两个字段全表 NULL",
+    "turnover_ma7": "同上",
+    "list_ratio": "需 listings ÷ supply —— supply 永远拿不到",
+    "list_slope_7d": "需 listings 历史 —— 只能靠 /price/batch 前向积累，现在全表 NULL",
+    "event_bearish_30d": "需 events 表有数据 —— llm.extract_supply_events 写好了，但没有落库环节",
+    "event_bullish_30d": "同上",
+    "event_conf_max": "同上",
 }
+
+# 单调约束：把经验法则硬编码进模型，小样本下最有效的防过拟合手段。
+# 只保留原料真实存在的列 —— 对常数列加约束等于给自己假的安全感。
+MONOTONE: dict[str, int] = {
+    "case_rarity_score": 1,     # 箱子越稀有 → 新增供给越少 → 未来收益越高
+    "supply_rigidity": 1,       # 供给刚性 → 越好
+}
+# 已被移除的约束与原因（留痕，别顺手加回来）：
+#   case_volume_30d / supply_growth_30d / supply_peer_pct / turnover /
+#   list_ratio / list_slope_7d —— 对应列当前恒为常数，约束无意义。
+#   rel_ret_21d: +1 —— market_index 表是空的，rel_ret_21d 实际就是 ret_21d，
+#     这个约束会变成「21 日动量恒为正向贡献」，与「跌 2~4 周后买入」的先验直接冲突。
+#     等大盘指数真的接上数据源再加回来。
 
 CFG = Cfg()

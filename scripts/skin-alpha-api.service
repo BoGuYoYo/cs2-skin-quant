@@ -1,26 +1,41 @@
 # /etc/systemd/system/skin-alpha-api.service
 #
-# 服务器侧只读 API（可选组件）。Tunnel 只需要连到 127.0.0.1:8788，
-# 服务器不需要开放任何入站端口。
+# 服务器侧只读 API（线上 /api/* 的后端）。
 #
 #   sudo cp scripts/skin-alpha-api.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now skin-alpha-api
 #
-# 定时跑管线用 systemd timer（比 cron 更好排障）。
+# ⚠️ 必须装成 systemd 服务，不能 nohup 手动起。
+#    踩过的坑：这个进程原先是用 nohup 拉起来的，于是
+#      - 它随启动它的 shell 会话一起死（2026-10-11 19:44 就这么死的）
+#      - 死了没有人重启：Caddy 还活着、/ 静态页还返回 200，
+#        只有 /api/* 静默变成 502 —— 从外面看「网站开着但数据全空」，
+#        极难归因。这也正是 Restart=always 存在的理由。
+#
+# ⚠️ User 必须是 huangzefa：仓库里这份模板原写的是 skinalpha，
+#    但机器上根本没有这个用户，照抄会直接启动失败（217/USER）。
+#
+# 定时跑管线用 systemd timer（见 skin-alpha-daily.timer）。
 
 [Unit]
 Description=skin-alpha server API
+Documentation=https://github.com/BoGuYoYo/cs2-skin-quant
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=skinalpha
+User=huangzefa
+Group=huangzefa
 WorkingDirectory=/opt/skin-alpha/server
 EnvironmentFile=/opt/skin-alpha/server/.env
 ExecStart=/opt/skin-alpha/server/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8788
-Restart=on-failure
+
+# 进程被 OOM 杀掉也必须拉起来（4G 机器上跑 pandas 训练时真发生过）
+Restart=always
 RestartSec=5
+StartLimitIntervalSec=0
+
 StandardOutput=append:/var/log/skin-alpha/api.log
 StandardError=append:/var/log/skin-alpha/api.log
 

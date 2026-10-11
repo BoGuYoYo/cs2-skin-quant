@@ -23,7 +23,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from pipeline import collector, decide, features, labels  # noqa: E402
-from pipeline.config import CFG, FEATURE_COLS  # noqa: E402
+from pipeline.config import CFG, FEATURE_COLS, FEATURE_COLS_PENDING, MONOTONE  # noqa: E402
 
 FAIL: list[str] = []
 
@@ -274,7 +274,7 @@ def test_no_constant_features_when_inputs_present() -> None:
             constants.append(f"{c}(缺失)")
         elif feats[c].nunique(dropna=True) <= 1:
             constants.append(c)
-    check("完整原料下 23 个特征全部有变化", not constants,
+    check(f"完整原料下 {len(FEATURE_COLS)} 个特征全部有变化", not constants,
           f"常数特征：{constants}" if constants else f"{len(FEATURE_COLS)} 个特征全部存活")
 
     # 反证：拿掉 case_id 这列，case_rarity_score 必须退回默认常数 50
@@ -282,6 +282,16 @@ def test_no_constant_features_when_inputs_present() -> None:
     check("去掉 case_id 后稀有度确实退化成常数（说明检测有效）",
           bare["case_rarity_score"].nunique(dropna=True) == 1,
           f"unique={bare['case_rarity_score'].nunique(dropna=True)}")
+
+    # ---- 配置层面的两条不变量 ----
+    overlap = set(FEATURE_COLS) & set(FEATURE_COLS_PENDING)
+    check("待接入列不得混进 FEATURE_COLS", not overlap, f"重叠：{overlap}")
+
+    orphan = set(MONOTONE) - set(FEATURE_COLS)
+    check("MONOTONE 不能约束不在特征集里的列", not orphan,
+          f"孤儿约束：{orphan}（对常数列加约束 = 假装有约束）")
+    dead_mono = [c for c in MONOTONE if c in feats.columns and feats[c].nunique(dropna=True) <= 1]
+    check("MONOTONE 约束的列在完整原料下都必须有变化", not dead_mono, f"受约束的常数列：{dead_mono}")
 
 
 def main() -> int:

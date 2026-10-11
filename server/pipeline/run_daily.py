@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import math
@@ -86,7 +87,22 @@ def load_or_train(cfg: Cfg, labeled: pd.DataFrame) -> tuple[QuantileModel, CQR, 
     need_train = True
     if cfg.model_path.exists():
         age_days = (time.time() - cfg.model_path.stat().st_mtime) / 86400
-        need_train = age_days >= cfg.retrain_days
+        # 特征列一变，缓存模型必须作废。
+        # 踩过的坑（同类问题的隐患）：原先只看模型文件的新鲜度，而
+        # QuantileModel._X() 会 reindex(columns=self.cols, fill_value=0.0) ——
+        # 于是「改了 FEATURE_COLS 但模型被复用」既不会报错、也不会崩，
+        # 只会拿着一套错位的列静默预测出垃圾。这种错最难发现，必须显式挡住。
+        cached_cols: list[str] = []
+        try:
+            cached = QuantileModel.load(cfg.model_path)
+            cached_cols = list(cached.cols)
+        except Exception as e:                      # 模型文件损坏/格式变了
+            log.warning("缓存模型无法加载（%s），重训", e)
+        same_cols = cached_cols == list(FEATURE_COLS)
+        if not same_cols:
+            log.info("特征列与缓存模型不一致（缓存 %d 列 / 现在 %d 列），强制重训",
+                     len(cached_cols), len(FEATURE_COLS))
+        need_train = age_days >= cfg.retrain_days or not same_cols
         log.info("现有模型 %.2f 天，%s", age_days, "需要重训" if need_train else "复用")
 
     if not need_train:
@@ -112,6 +128,60 @@ def load_or_train(cfg: Cfg, labeled: pd.DataFrame) -> tuple[QuantileModel, CQR, 
         cqr = CQR(alpha=cfg.cqr_alpha)
         cqr.Q = 0.0
     return mdl, cqr, meta
+
+
+def _snap_items(con) -> list[str]:
+    """快照仓里有数据的全部品种"""
+    return [r[0] for r in con.execute("SELECT DISTINCT item_id FROM snap ORDER BY item_id").fetchall()]
+
+
+def _load_feats_batched(
+    con,
+    items: list[str],
+    days: int,
+    case_df: pd.DataFrame,
+    index_df: pd.DataFrame | None,
+    events_df: pd.DataFrame | None,
+    cfg: Cfg,
+    only_latest: bool = False,
+) -> pd.DataFrame:
+    """按品种分块算特征，把峰值内存压到 1/N。
+
+    为什么必须分块：
+        回填完成后 snap 有 542 万行（原来 216 万行）。一次性
+        load_history → features.build 会让 python 吃到 3.1GB RSS + 2.1GB swap，
+        被内核 OOM 直接杀掉 —— 而且死得毫无痕迹：日志停在上一行、没有 traceback，
+        看上去就像「跑到一半自己没了」（2026-10-11 21:19 实际发生过）。
+
+    only_latest=True 时每块只保留每个品种的最后一行：
+        推理只需要截面，不需要序列，于是内存只跟品种数成正比，
+        和「历史有多长」彻底解耦。
+    """
+    import gc
+
+    parts: list[pd.DataFrame] = []
+    batch = max(int(cfg.feat_batch_items), 1)
+    done = 0
+    rows_acc = 0
+    for i in range(0, len(items), batch):
+        chunk = items[i : i + batch]
+        h = collector.load_history(con, days=days, items=chunk)
+        if h.empty:
+            continue
+        f = features.build(h, case_df, index_df, events_df)
+        del h
+        out = features.latest_cross_section(f) if only_latest else f
+        del f
+        parts.append(out)
+        rows_acc += len(out)
+        done += len(chunk)
+        if (i // batch) % 5 == 0:
+            log.info("  特征分块 %d/%d 品种，累计 %d 行", done, len(items), rows_acc)
+        gc.collect()
+
+    if not parts:
+        return pd.DataFrame()
+    return pd.concat(parts, ignore_index=True)
 
 
 def model_train(train_part: pd.DataFrame, w: np.ndarray, cfg: Cfg) -> QuantileModel:
@@ -140,7 +210,7 @@ def _split_tail(df: pd.DataFrame, frac: float, horizon: int) -> tuple[pd.DataFra
     return train, calib
 
 
-def _push_cold_start(con, cfg: Cfg, day: str, now_ts: int, hist, reason: str) -> None:
+def _push_cold_start(con, cfg: Cfg, day: str, now_ts: int, labeled, reason: str) -> None:
     """冷启动期（标签未成熟）只推送基础数据。
 
     没有 forecast / factor_latest —— 前端会显示「今日打分标的 0」，
@@ -168,11 +238,11 @@ def _push_cold_start(con, cfg: Cfg, day: str, now_ts: int, hist, reason: str) ->
                 {"k": "last_run", "v": day, "updated_at": now_ts},
                 {"k": "status", "v": "cold_start", "updated_at": now_ts},
                 {"k": "cold_start_reason", "v": reason[:200], "updated_at": now_ts},
-                {"k": "snap_rows", "v": str(len(hist)), "updated_at": now_ts},
+                {"k": "feature_rows", "v": str(len(labeled)), "updated_at": now_ts},
             ], {}),
             ("runs", [
                 {"ts": now_ts, "stage": "daily-coldstart", "ok": 1, "rows": len(item_rows),
-                 "message": f"冷启动采集 {len(hist)} 行快照；预测已跳过"},
+                 "message": f"冷启动：特征 {len(labeled)} 行；预测已跳过"},
             ], {}),
         ]
         for stage, rows, kw in plan:
@@ -183,11 +253,11 @@ def _push_cold_start(con, cfg: Cfg, day: str, now_ts: int, hist, reason: str) ->
 
 
 # ------------------------------------------------------------------ 主流程
-def run(dry_run: bool = False, backtest_only: bool = False) -> int:
+def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool = False) -> int:
     cfg = CFG
     cfg.ensure_dirs()
     key = os.environ.get("STEAMDT_KEY", "")
-    if not key:
+    if not key and not skip_collect:
         log.error("STEAMDT_KEY 未配置，退出")
         return 2
 
@@ -198,56 +268,79 @@ def run(dry_run: bool = False, backtest_only: bool = False) -> int:
     fails: list[str] = []
 
     # ---------------- 1. 采集 ----------------
+    # 采集只提供「价格」这一件事的增量，但它要占掉整个管线 90% 的时间
+    # （18853 个品种 × 0.6s ≈ 3.2 小时）。改代码后想快速看新模型，用
+    # --skip-collect 复用已有历史，30 分钟就能跑完特征+训练+预测。
     watchlist = load_watchlist(con)
-    if not watchlist:
-        log.warning("items 表为空，先跑一次 base 同步（每天限 1 次）")
+    if skip_collect:
+        log.info("--skip-collect：跳过采集，直接用库里的历史（监控池 %d 个）", len(watchlist))
+    else:
+        if not watchlist:
+            log.warning("items 表为空，先跑一次 base 同步（每天限 1 次）")
+            try:
+                base = collector.fetch_base(key)
+                n = collector.write_items(con, base, int(time.time()))
+                log.info("已写入 %d 个饰品基础信息", n)
+                watchlist = load_watchlist(con)
+            except Exception as e:
+                log.error("base 同步失败：%s", e)
+                return 3
+
+        log.info("监控池 %d 个可交易品种（武器皮肤 + 探员）", len(watchlist))
+
+        # WATCH_LIMIT=0 表示不限量。
+        limit = int(os.environ.get("WATCH_LIMIT", "0"))
+        pool = watchlist if limit <= 0 else watchlist[:limit]
+
+        # 采集通道：
+        #   kline（默认）= /open/cs2/item/v1/kline，120 次/分钟，一次拿整段历史（能补漏掉的日期）
+        #   batch       = /price/batch，1 次/分钟 × 100 个，只有当前快照
+        mode = os.environ.get("COLLECT_MODE", "kline").strip().lower()
         try:
-            base = collector.fetch_base(key)
-            n = collector.write_items(con, base, int(time.time()))
-            log.info("已写入 %d 个饰品基础信息", n)
-            watchlist = load_watchlist(con)
+            if mode == "batch":
+                log.info("采集[batch] %d 个，预计 %.0f 分钟", len(pool), len(pool) / 100 * 61 / 60)
+                blocks = collector.fetch_prices(pool, key, session)
+                n = collector.write_daily_snapshot(con, blocks, day)
+                log.info("写入当日快照 %d 行", n)
+            else:
+                log.info("采集[kline] %d 个，预计 %.0f 分钟", len(pool), len(pool) * 0.6 / 60)
+                stats = collector.collect_daily_kline(con, session, key, pool)
+                log.info("K线采集结果：成功 %d / 空 %d / 失败 %d / 写入 %d 行",
+                         stats["ok"], stats["empty"], stats["fail"], stats["rows"])
         except Exception as e:
-            log.error("base 同步失败：%s", e)
-            return 3
-
-    log.info("监控池 %d 个可交易品种（武器皮肤 + 探员）", len(watchlist))
-
-    # WATCH_LIMIT=0 表示不限量。
-    limit = int(os.environ.get("WATCH_LIMIT", "0"))
-    pool = watchlist if limit <= 0 else watchlist[:limit]
-
-    # 采集通道：
-    #   kline（默认）= /open/cs2/item/v1/kline，120 次/分钟，一次拿整段历史（能补漏掉的日期）
-    #   batch       = /price/batch，1 次/分钟 × 100 个，只有当前快照
-    mode = os.environ.get("COLLECT_MODE", "kline").strip().lower()
-    try:
-        if mode == "batch":
-            log.info("采集[batch] %d 个，预计 %.0f 分钟", len(pool), len(pool) / 100 * 61 / 60)
-            blocks = collector.fetch_prices(pool, key, session)
-            n = collector.write_daily_snapshot(con, blocks, day)
-            log.info("写入当日快照 %d 行", n)
-        else:
-            log.info("采集[kline] %d 个，预计 %.0f 分钟", len(pool), len(pool) * 0.6 / 60)
-            stats = collector.collect_daily_kline(con, session, key, pool)
-            log.info("K线采集结果：成功 %d / 空 %d / 失败 %d / 写入 %d 行",
-                     stats["ok"], stats["empty"], stats["fail"], stats["rows"])
-    except Exception as e:
-        fails.append(f"采集失败: {e}")
-        log.error("采集失败：%s", e)
+            fails.append(f"采集失败: {e}")
+            log.error("采集失败：%s", e)
 
     # ---------------- 2. 特征 ----------------
-    hist = collector.load_history(con)
-    if hist.empty:
-        log.error("本地无历史数据，无法继续")
-        return 4
-
     case_df = pd.DataFrame(cases_mod.load_cases(con))
     index_df = _load_index(con)
     events_df = _load_events(con)
 
-    feats = features.build(hist, case_df, index_df, events_df)
+    all_items = _snap_items(con)
+    if not all_items:
+        log.error("本地无历史数据，无法继续")
+        return 4
+
+    # 训练集按品种抽样：542 万行全量训练在 4G 内存上跑不动，而横截面样本
+    # 彼此高度相关，抽 4000 个品种（约 130 万行）对分位数回归的损失很小。
+    train_items = all_items
+    if 0 < cfg.train_item_limit < len(all_items):
+        rng = np.random.default_rng(20261011)   # 固定种子：抽样可复现，便于对比两版模型
+        train_items = sorted(
+            rng.choice(np.array(all_items), size=cfg.train_item_limit, replace=False).tolist()
+        )
+        log.info("训练集抽样 %d/%d 个品种（内存约束，TRAIN_ITEM_LIMIT 可调）",
+                 len(train_items), len(all_items))
+
+    feats = _load_feats_batched(con, train_items, 1200, case_df, index_df, events_df, cfg)
+    if feats.empty:
+        log.error("特征宽表为空，无法继续")
+        return 4
     labeled = labels.make_labels(feats, cfg)
-    log.info("特征宽表 %d 行 × %d 列", len(labeled), labeled.shape[1])
+    log.info("特征宽表 %d 行 × %d 列（训练集 %d 个品种）",
+             len(labeled), labeled.shape[1], len(train_items))
+    del feats
+    gc.collect()
 
     # ---------------- 3. 回测模式 ----------------
     if backtest_only:
@@ -272,11 +365,19 @@ def run(dry_run: bool = False, backtest_only: bool = False) -> int:
         task_progress.fail("train", str(e))
         if not dry_run:
             log.warning("冷启动期：跳过预测，但仍推送已采集的基础数据（items / kline）")
-            _push_cold_start(con, cfg, day, now_ts, hist, str(e))
+            _push_cold_start(con, cfg, day, now_ts, labeled, str(e))
         return 5
 
     # ---------------- 5. 推理 ----------------
-    latest = features.latest_cross_section(labeled)
+    # 推理要覆盖全部品种（16k 个），但每个品种只需要最后一行 →
+    # 分块算特征、每块只留截面，内存与历史长度解耦。
+    latest = _load_feats_batched(
+        con, all_items, cfg.infer_days, case_df, index_df, events_df, cfg, only_latest=True
+    )
+    if latest.empty:
+        log.error("推理截面为空，无法继续")
+        return 6
+    log.info("推理截面 %d 行 × %d 列（近 %d 天）", len(latest), latest.shape[1], cfg.infer_days)
     P = mdl.predict(latest[FEATURE_COLS])
 
     # 经济先验模型（带单调约束，见 model.train_prior）：
@@ -536,6 +637,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="skin-alpha 每日管线")
     ap.add_argument("--dry-run", action="store_true", help="只计算不推送")
     ap.add_argument("--backtest", action="store_true", help="只做 walk-forward 评估并打印验收结论")
+    ap.add_argument("--skip-collect", action="store_true",
+                    help="跳过采集（复用库里已有历史）—— 改完特征/模型后快速重跑用，"
+                         "省掉 3.2 小时的 K 线采集")
     ap.add_argument("--check-push", action="store_true", help="只测推送通道连通性（不采集不训练）")
     args = ap.parse_args()
 
@@ -549,7 +653,7 @@ def main() -> int:
         )
         return 0 if ok else 1
 
-    return run(dry_run=args.dry_run, backtest_only=args.backtest)
+    return run(dry_run=args.dry_run, backtest_only=args.backtest, skip_collect=args.skip_collect)
 
 
 if __name__ == "__main__":

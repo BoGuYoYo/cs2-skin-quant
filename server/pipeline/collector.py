@@ -441,7 +441,11 @@ def collect_daily_kline(
     return stats
 
 
-def load_history(con: sqlite3.Connection, days: int = 1200) -> pd.DataFrame:
+def load_history(
+    con: sqlite3.Connection,
+    days: int = 1200,
+    items: list[str] | None = None,
+) -> pd.DataFrame:
     """读取本地快照仓 → 宽表 DataFrame
 
     必须 JOIN items 取 case_id —— 这是供给面特征能否生效的关键。
@@ -454,13 +458,26 @@ def load_history(con: sqlite3.Connection, days: int = 1200) -> pd.DataFrame:
     pandas 会把整列 NULL 推断成 object，进而让 turnover = volume/supply 也是 object，
     LightGBM 会直接拒绝（"pandas dtypes must be int, float or bool"）。
     所以这里必须显式 to_numeric 兜住。
+
+    items: 只取这些品种（None = 全部）。
+        4G 内存的机器上一次读 542 万行再算特征会被内核 OOM 杀掉，
+        所以 run_daily 改成按品种分块调用本函数（见 _load_feats_batched）。
     """
+    where = ""
+    params: list[Any] = []
+    if items is not None:
+        if not items:
+            return pd.DataFrame()
+        where = " WHERE s.item_id IN (%s)" % ",".join(["?"] * len(items))
+        params = list(items)
+
     df = pd.read_sql_query(
         """SELECT s.item_id, s.date, s.sell AS price, s.bid, s.listings, s.volume, s.supply,
                   i.case_id AS case_id, i.case_name AS case_name
              FROM snap s
-             LEFT JOIN items i ON i.item_id = s.item_id""",
+             LEFT JOIN items i ON i.item_id = s.item_id""" + where,
         con,
+        params=params,
     )
     if df.empty:
         return df

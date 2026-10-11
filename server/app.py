@@ -222,6 +222,13 @@ def screener(
 ) -> dict[str, Any]:
     con = db()
     try:
+        # ⚠️ 这里对「当前没有数据源的列」必须放宽成 IS NULL 放行，不能 COALESCE 成 0。
+        #    踩过的坑：turnover（换手率 = volume/supply）的条件原先写成
+        #        COALESCE(fl.turnover, 0) >= 0.002
+        #    而 snap 的 volume/supply 全表 NULL → turnover 恒为 0 → 0 >= 0.002 永假
+        #    → 这个筛选器**永远返回空**，用户看到的是「候选页没有东西」，
+        #    却完全看不出是被一个没有数据源的筛选条件卡死的。
+        #    语义修正：字段缺失 = 「不知道」，不该当成「不合格」排除掉。
         rows = con.execute(
             """SELECT fl.item_id, fl.price, fl.dd_from_high, fl.drop_duration_days, fl.ret_21d,
                       fl.turnover, fl.list_ratio, fl.supply_peer_pct, fl.case_rarity_score,
@@ -229,8 +236,8 @@ def screener(
                  FROM factor_latest fl
                  LEFT JOIN items i ON i.item_id = fl.item_id
                 WHERE fl.price BETWEEN ? AND ?
-                  AND COALESCE(fl.turnover, 0) >= ?
-                  AND COALESCE(fl.list_ratio, 0) <= ?
+                  AND (fl.turnover   IS NULL OR fl.turnover   >= ?)
+                  AND (fl.list_ratio IS NULL OR fl.list_ratio <= ?)
                   AND COALESCE(fl.case_rarity_score, 0) >= ?
                 ORDER BY fl.case_rarity_score DESC, fl.drop_duration_days DESC
                 LIMIT ?""",
