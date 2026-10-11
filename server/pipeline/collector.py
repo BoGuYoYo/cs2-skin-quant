@@ -18,6 +18,8 @@ from typing import Any, Iterable
 import pandas as pd
 import requests
 
+from .config import DOMAIN_EXCLUDE_SQL
+
 log = logging.getLogger("collector")
 
 STEAMDT_BASE = "https://open.steamdt.com"
@@ -224,6 +226,101 @@ def write_daily_snapshot(con: sqlite3.Connection, blocks: Iterable[dict[str, Any
     return n
 
 
+# ------------------------------------------------- 流动性数据（在售挂单量 / 求购量）
+#
+# 用户的规则：「日交易量 <20/天 不看」。
+# 但实测 SteamDT **没有成交量接口** ——
+#   kline：小时/日/周 × BUFF/STEAM，一律 5 个字段（ts,o,c,h,l），纯价格
+#   /price/*：只有 sellPrice(在售价) sellCount(在售量) biddingPrice(求购价) biddingCount(求购量)
+# 所以只能拿「在售挂单量 sellCount」当流动性代理：挂单量 < 20 的品种，
+# 要么真的没人交易，要么盘口薄到没有意义，与「交易量低的不看」的意图一致。
+#
+# ⚠️ 它只有当前快照，**历史补不回来**（公开数据集只有 2022-02-14 单日）。
+#    想用就得从今天开始前向积累，这也是下面这个循环存在的唯一理由。
+
+LISTINGS_CURSOR_KEY = "listings_cursor"
+
+
+def _meta_get(con: sqlite3.Connection, k: str, default: str | None = None) -> str | None:
+    try:
+        r = con.execute("SELECT v FROM meta WHERE k = ?", (k,)).fetchone()
+    except sqlite3.OperationalError:      # meta 表还没建（纯采集脚本首次跑）
+        return default
+    return r[0] if r else default
+
+
+def _meta_set(con: sqlite3.Connection, k: str, v: str) -> None:
+    con.execute(
+        "INSERT INTO meta (k, v, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at",
+        (k, v, int(time.time())),
+    )
+    con.commit()
+
+
+def collect_listings(
+    con: sqlite3.Connection,
+    session: requests.Session,
+    api_key: str,
+    names: list[str],
+    interval: float = BATCH_INTERVAL,
+    max_batches: int | None = None,
+    log_every: int = 5,
+) -> dict[str, int]:
+    """按 1 次/分钟的配额循环拉挂单量，写进 snap，断点续跑。
+
+    配额现实：一批 100 个，18853 个品种一轮 = 189 批 = 189 分钟。
+    进度存在 meta.listings_cursor，重启后接着上次的位置跑，不从头再来。
+
+    max_batches: 只跑 N 批就返回（测试用；None = 跑满一轮）。
+    """
+    day = datetime.now().strftime("%Y-%m-%d")
+    stats = {"batches": 0, "items": 0, "rows": 0, "fail": 0, "day": day}
+    if not names:
+        return stats
+
+    try:
+        cur = int(_meta_get(con, LISTINGS_CURSOR_KEY, "0") or 0)
+    except ValueError:
+        cur = 0
+    if cur >= len(names):
+        cur = 0
+        log.info("挂单量采集：上一轮已走完，从头发起新一轮（%d 个品种）", len(names))
+
+    n_chunks = (len(names) + BATCH_MAX - 1) // BATCH_MAX
+    while stats["batches"] < (max_batches or n_chunks * 10**6):
+        if cur >= len(names):
+            log.info("挂单量采集：一轮结束（%d 个品种 / %d 批），从头发起新一轮",
+                     len(names), n_chunks)
+            cur = 0
+        chunk = names[cur : cur + BATCH_MAX]
+        if not chunk:
+            break
+
+        try:
+            blocks = fetch_prices(chunk, api_key, session, interval=interval)
+        except RuntimeError as e:
+            # 不静默丢批：记下来、退避、下一轮再补这些品种（游标不动）
+            stats["fail"] += len(chunk)
+            log.error("挂单量采集失败（游标停在 %d，下轮重试）：%s", cur, e)
+            time.sleep(interval * 2)
+            continue
+
+        stats["rows"] += write_daily_snapshot(con, blocks, day)
+        stats["items"] += len(chunk)
+        stats["batches"] += 1
+        cur += len(chunk)
+        _meta_set(con, LISTINGS_CURSOR_KEY, str(cur))
+
+        if stats["batches"] % log_every == 0:
+            pct = cur / len(names) * 100
+            log.info("  挂单量 %d/%d（%.1f%%，第 %d 批，累计写入 %d 行）",
+                     cur, len(names), pct, stats["batches"], stats["rows"])
+        time.sleep(interval)
+
+    return stats
+
+
 def write_items(con: sqlite3.Connection, base: list[dict[str, Any]], now: int) -> int:
     """用 /base 的返回填充 items 表。
 
@@ -256,6 +353,11 @@ def _wear(market_hash_name: str) -> str | None:
     return None
 
 
+#: 域外品种（纪念品 / StatTrak）的排除条件来自 config.DOMAIN_EXCLUDE_SQL ——
+#: 唯一来源在那边，本文件不要另写一份，否则前端列表 / 采集池 / 推理口径必然打架。
+# 监控池定义：只保留可交易的武器皮肤与探员。
+
+
 # 监控池定义：只保留可交易的武器皮肤与探员。
 #
 # 踩过的坑：/base 返回 44497 个品种，但其中大量是**不可交易**的道具 ——
@@ -282,6 +384,7 @@ WATCHLIST_SQL = """
      AND market_hash_name NOT LIKE '%Capsule%'
      AND market_hash_name NOT LIKE '%Graffiti%'
      AND market_hash_name NOT LIKE '%Patch%'
+""" + DOMAIN_EXCLUDE_SQL + """
    ORDER BY market_hash_name
 """
 

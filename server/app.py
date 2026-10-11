@@ -43,6 +43,32 @@ if not DB_PATH.is_absolute():
     DB_PATH = HERE / DB_PATH
 
 
+_DOMAIN_SQL: str | None = None
+
+
+def domain_exclude_sql() -> str:
+    """域外品种（纪念品 / StatTrak）的 SQL 排除条件。
+
+    规则唯一来源在 pipeline/config.py 的 DOMAIN_EXCLUDE_SQL —— 这里只做转发，
+    绝不要在本文件里再抄一份（抄了就会漂移：采集池过滤了、接口没过滤，
+    于是「监控池里看不见、候选页里又有」）。
+
+    为什么是惰性导入：API 进程不需要 pandas / requests，而 pipeline 包会带进来。
+    只在真正查询时导一次，导不动就退化成不过滤（宁可多显示，不可因为
+    一个可选过滤把整个列表接口搞挂）。
+    """
+    global _DOMAIN_SQL
+    if _DOMAIN_SQL is None:
+        try:
+            from pipeline.config import DOMAIN_EXCLUDE_SQL
+
+            _DOMAIN_SQL = DOMAIN_EXCLUDE_SQL
+        except Exception as e:      # noqa: BLE001
+            log.warning("域过滤条件加载失败（%s），本次查询不过滤", e)
+            _DOMAIN_SQL = ""
+    return _DOMAIN_SQL
+
+
 # ---------------------------------------------------------------- 工具
 def db() -> sqlite3.Connection:
     """只读连接 —— 这是自托管 API 快的关键。
@@ -189,6 +215,9 @@ def candidates(
         if rarityMin is not None:
             where.append("COALESCE(fl.case_rarity_score, 0) >= ?")
             binds.append(rarityMin)
+        # 用户规则：纪念品 / StatTrak 不看。推理截面已经滤过一遍，
+        # 这里再兜一层是因为历史行（以及换口径之前写进去的行）还在库里。
+        # DOMAIN_EXCLUDE_SQL 以 " AND " 开头，正好接在条件串后面。
         binds.append(limit)
 
         order_col = SORT_COLS.get(sort, SORT_COLS["score"])
@@ -202,7 +231,7 @@ def candidates(
               FROM forecast f
               LEFT JOIN items i ON i.item_id = f.item_id
               LEFT JOIN factor_latest fl ON fl.item_id = f.item_id
-             WHERE {' AND '.join(where)}
+             WHERE {' AND '.join(where)}""" + domain_exclude_sql() + f"""
              ORDER BY {order_col} {direction}
              LIMIT ?
         """
@@ -238,7 +267,7 @@ def screener(
                 WHERE fl.price BETWEEN ? AND ?
                   AND (fl.turnover   IS NULL OR fl.turnover   >= ?)
                   AND (fl.list_ratio IS NULL OR fl.list_ratio <= ?)
-                  AND COALESCE(fl.case_rarity_score, 0) >= ?
+                  AND COALESCE(fl.case_rarity_score, 0) >= ?""" + domain_exclude_sql() + """
                 ORDER BY fl.case_rarity_score DESC, fl.drop_duration_days DESC
                 LIMIT ?""",
             (priceMin, priceMax, turnoverMin, listRatioMax, rarityMin, limit),

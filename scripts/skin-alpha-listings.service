@@ -1,0 +1,46 @@
+# /etc/systemd/system/skin-alpha-listings.service
+#
+# 常驻挂单量采集 —— 给「日交易量 <20 不看」这条规则喂数。
+#
+#   sudo cp scripts/skin-alpha-listings.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now skin-alpha-listings
+#
+# 为什么要常驻而不是每天跑一次：
+#   /price/batch 配额是 1 次/分钟 × 100 个，全量 18853 个品种一轮要 189 分钟。
+#   常驻循环 = 一轮接一轮（约 3.2 小时一轮），游标存在 meta.listings_cursor，
+#   重启后接着上次的位置跑。每天跑一次反而会让大部分品种的挂单量过期一整天。
+#
+# 它用的是 /price/batch 的独立配额，和日线管线的 kline 配额（120 次/分钟）互不影响，
+# 所以不会拖慢每天 07:00 的那一轮采集。
+#
+# 关掉它：sudo systemctl disable --now skin-alpha-listings
+#   （关掉后流动性闸门会因为没数据而自动失效，并每天在日志里告警一次 —— 见
+#     run_daily._apply_liquidity_gate，不会被当成「全部不合格」误杀。）
+
+[Unit]
+Description=skin-alpha listings collector (在售挂单量，喂流动性闸门)
+Documentation=https://github.com/BoGuYoYo/cs2-skin-quant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=huangzefa
+Group=huangzefa
+WorkingDirectory=/opt/skin-alpha/server
+EnvironmentFile=/opt/skin-alpha/server/.env
+ExecStart=/opt/skin-alpha/server/.venv/bin/python -m pipeline.listings
+
+# 网络抖动/接口异常都要自己爬起来；游标保证不会重复劳动
+Restart=always
+RestartSec=30
+StartLimitIntervalSec=0
+
+StandardOutput=append:/var/log/skin-alpha/listings.log
+StandardError=append:/var/log/skin-alpha/listings.log
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

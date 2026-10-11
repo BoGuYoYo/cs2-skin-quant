@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover
 from . import cases as cases_mod
 from . import collector, decide, features, labels, llm
 from .calibrate import CQR
-from .config import CFG, FEATURE_COLS, Cfg
+from .config import CFG, DOMAIN_EXCLUDE_SQL, FEATURE_COLS, Cfg
 from .model import QuantileModel, acceptance, walk_forward
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -131,8 +131,49 @@ def load_or_train(cfg: Cfg, labeled: pd.DataFrame) -> tuple[QuantileModel, CQR, 
 
 
 def _snap_items(con) -> list[str]:
-    """快照仓里有数据的全部品种"""
-    return [r[0] for r in con.execute("SELECT DISTINCT item_id FROM snap ORDER BY item_id").fetchall()]
+    """快照仓里有数据的品种 —— 已剔除域外的纪念品 / StatTrak。
+
+    口径必须和采集监控池一致（都用 config.DOMAIN_EXCLUDE_SQL）：
+    否则会出现「采集时不看、预测时又冒出来」的不一致。
+    """
+    return [
+        r[0]
+        for r in con.execute(
+            "SELECT DISTINCT s.item_id FROM snap s"
+            " JOIN items i ON i.item_id = s.item_id"
+            " WHERE 1=1" + DOMAIN_EXCLUDE_SQL
+        ).fetchall()
+    ]
+
+
+def _apply_liquidity_gate(latest: pd.DataFrame, cfg: Cfg) -> pd.DataFrame:
+    """用户规则：「日交易量低的不看（小于 20 一天）」。
+
+    比的是在售挂单量（唯一可得的流动性代理，理由见 collector.collect_listings）。
+
+    这个函数存在的唯一理由是**怎么处理缺失数据**：
+        挂单量采集器还没积累出数据时 listings 会是全表 NULL。
+        如果这时写成 `COALESCE(listings, 0) >= 20`，就等于把所有品种判成「不合格」，
+        页面直接空掉 —— 这正是 /api/screener 栽过的跟头（同一个坑，第二次出现）。
+        所以纪律是：**不知道就放行**，并每天在日志里喊一声闸门当前没生效。
+    """
+    if latest.empty:
+        return latest
+    if "listings" not in latest.columns:
+        log.warning("流动性闸门未生效：截面里没有 listings 列")
+        return latest
+
+    known = latest["listings"].notna()
+    if not bool(known.any()):
+        log.warning("流动性闸门未生效：listings 全为空（挂单量采集器还没积累出数据）"
+                    " —— 不把「不知道」当「不合格」，全部放行")
+        return latest
+
+    keep = (~known) | (latest["listings"] >= cfg.gate_listings)
+    dropped = int((~keep).sum())
+    log.info("流动性闸门：挂单量已知 %d 行；剔除挂单量 < %d 的 %d 个品种，保留 %d 行",
+             int(known.sum()), cfg.gate_listings, dropped, int(keep.sum()))
+    return latest[keep].reset_index(drop=True)
 
 
 def _load_feats_batched(
@@ -378,6 +419,12 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
         log.error("推理截面为空，无法继续")
         return 6
     log.info("推理截面 %d 行 × %d 列（近 %d 天）", len(latest), latest.shape[1], cfg.infer_days)
+
+    # 用户规则：日交易量（用挂单量代理）< 20 不看
+    latest = _apply_liquidity_gate(latest, cfg)
+    if latest.empty:
+        log.error("流动性闸门把截面全部剔除，无法继续")
+        return 6
     P = mdl.predict(latest[FEATURE_COLS])
 
     # 经济先验模型（带单调约束，见 model.train_prior）：

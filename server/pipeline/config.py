@@ -75,7 +75,13 @@ class Cfg:
         ("L3", -25.0, 4.5, 2),
     )
     confirm_n: int = 2
-    gate_listings: int = 10
+    #: 流动性闸门 —— 用户 2026-10-11 的规则：「日交易量低的不看（小于 20 一天）」。
+    #:
+    #: 注意这里比的是**在售挂单量 sellCount**，不是成交量：
+    #: 实测 SteamDT 没有成交量接口（kline 三个周期 × 两个平台都只有 5 个价格字段），
+    #: 只能用挂单量当流动性代理（见 collector.collect_listings 与 pipeline.listings）。
+    #: 数据缺失时闸门自动失效，不把「不知道」当「不合格」—— 见 run_daily._apply_liquidity_gate。
+    gate_listings: int = field(default_factory=lambda: _i("GATE_MIN_LISTINGS", 20))
     gate_volume: int = 3
 
     # ---------------- 路径 ----------------
@@ -149,3 +155,25 @@ MONOTONE: dict[str, int] = {
 #     等大盘指数真的接上数据源再加回来。
 
 CFG = Cfg()
+
+# ---------------------------------------------------------------- 域筛选（用户规则）
+#: 用户在 2026-10-11 定的规则：「纪念品不看；StatTrak 不看」。
+#:
+#: 单独抽成常量是因为它要在**三个地方**同时生效，漏一处就会出现
+#: 「监控池里没有、候选页里还有」这种前后不一致：
+#:   1) 采集监控池（别浪费配额去拉它们）
+#:   2) 推理截面（不进 forecast / factor_latest）
+#:   3) 前端列表接口（历史行还在库里，查询时兜一层）
+#:
+#: 注意区分「不看」和「删掉」：`items` 表仍然是完整目录（44k 个品种），
+#: 推送也照旧全量 —— 直接搜某个 StatTrak 还是能搜到详情页。
+#: 被排除的是「推荐/筛选/监控」这三个口径，不是数据本身。
+#:
+#: 命名事实（别改成更"聪明"的匹配）：CS2 里 StatTrak 带 ™
+#: （"StatTrak™ AK-47 | Redline (Field-Tested)"），匕首是
+#: "★ StatTrak™ Karambit | ..."；纪念品是 "Souvenir ..." 前缀。
+#: '%StatTrak%' / '%Souvenir%' 全覆盖且不会误伤。
+DOMAIN_EXCLUDE_SQL = (
+    " AND market_hash_name NOT LIKE '%Souvenir%'"
+    " AND market_hash_name NOT LIKE '%StatTrak%'"
+)

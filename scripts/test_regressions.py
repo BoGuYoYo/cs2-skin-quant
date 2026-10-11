@@ -294,6 +294,84 @@ def test_no_constant_features_when_inputs_present() -> None:
     check("MONOTONE 约束的列在完整原料下都必须有变化", not dead_mono, f"受约束的常数列：{dead_mono}")
 
 
+def test_domain_exclude_rules() -> None:
+    """用户规则：纪念品不看、StatTrak 不看（2026-10-11）。
+
+    这条规则必须在采集池和推理口径里同时生效，否则会出现
+    「监控池里看不见、候选页里又有」的不一致。
+    """
+    print("\n[11] 域筛选：纪念品 / StatTrak")
+    sql = collector.WATCHLIST_SQL
+    check("采集池排除纪念品", "NOT LIKE '%Souvenir%'" in sql)
+    check("采集池排除 StatTrak", "NOT LIKE '%StatTrak%'" in sql)
+
+    # 规则唯一来源：别在别的文件里另抄一份
+    src_run = (SERVER / "pipeline" / "run_daily.py").read_text(encoding="utf-8")
+    src_col = (SERVER / "pipeline" / "collector.py").read_text(encoding="utf-8")
+    src_api = (SERVER / "app.py").read_text(encoding="utf-8")
+    check("run_daily 用的是 config 里的同一份规则", "DOMAIN_EXCLUDE_SQL" in src_run)
+    check("collector 从 config 导入而不是自己写一份",
+          "from .config import DOMAIN_EXCLUDE_SQL" in src_col)
+    check("API 列表接口也兜了同一份规则", "domain_exclude_sql()" in src_api)
+
+    # 命名事实：StatTrak 带 ™，匹配用的是 %StatTrak%，别改成 'StatTrak '
+    check("匹配用的是不含空格的 %StatTrak%（匕首名是 '★ StatTrak™ ...'）",
+          "StatTrak%" in sql)
+
+
+def test_liquidity_gate_missing_data() -> None:
+    """用户规则：「日交易量 <20 不看」—— 但数据缺失时必须放行，不能全灭。
+
+    踩过的坑（同一个坑第二次）：/api/screener 曾写成
+    COALESCE(turnover, 0) >= 0.002，而 turnover 恒为 0 → 0 >= 0.002 永假
+    → 页面永远空白。流动性闸门要是照抄这个写法，挂单量还没积累时
+    会把所有品种判成"不合格"，同样全灭。
+    """
+    print("\n[12] 流动性闸门与缺失数据")
+    from pipeline.run_daily import _apply_liquidity_gate  # noqa: PLC0415
+
+    thr = CFG.gate_listings
+    check("阈值就是用户说的 20", thr == 20, f"gate_listings={thr}")
+
+    # ① 挂单量全空 → 全部放行
+    df = pd.DataFrame({"item_id": ["a", "b"], "listings": [None, None]})
+    out = _apply_liquidity_gate(df, CFG)
+    check("挂单量全空时全部放行（不把「不知道」当「不合格」）", len(out) == 2,
+          f"保留 {len(out)}/2")
+
+    # ② 有数据 → 严格按阈值卡
+    df2 = pd.DataFrame({"item_id": ["a", "b", "c"],
+                        "listings": [thr - 1, thr, 5000]})
+    out2 = _apply_liquidity_gate(df2, CFG)
+    check("挂单量 < 20 的剔除、>= 20 的保留",
+          out2["item_id"].tolist() == ["b", "c"], f"保留 {out2['item_id'].tolist()}")
+
+    # ③ 混合（部分品种还没采到）→ 未知的放行，已知且小的剔除
+    df3 = pd.DataFrame({"item_id": ["a", "b", "c"], "listings": [None, 5, 100]})
+    out3 = _apply_liquidity_gate(df3, CFG)
+    check("未知放行、已知不合格剔除",
+          out3["item_id"].tolist() == ["a", "c"], f"保留 {out3['item_id'].tolist()}")
+
+    # ④ 静态检查：筛选器不能再出现「把缺失当 0」的老写法。
+    #    注意要先去掉注释行 —— app.py 里那段注释正是在讲这次踩的坑，
+    #    里面**故意**留了旧写法的原文，直接全文匹配会误报。
+    api_src = (SERVER / "app.py").read_text(encoding="utf-8")
+    api_code = "\n".join(
+        ln for ln in api_src.splitlines() if not ln.strip().startswith("#")
+    )
+    check("screener 不再用 COALESCE(turnover, 0) >= 卡死",
+          "COALESCE(fl.turnover, 0) >=" not in api_code)
+    check("screener 改成 IS NULL 放行", "fl.turnover   IS NULL OR" in api_code)
+
+
+def test_update_schedule_is_7am_beijing() -> None:
+    """用户规则：早上七点左右开始更新（2026-10-11）。"""
+    print("\n[13] 更新时间：北京 07:00")
+    timer = (Path(__file__).resolve().parent / "skin-alpha-daily.timer").read_text(encoding="utf-8")
+    check("OnCalendar 是 UTC 23:00（= 北京 07:00）", "23:00:00 UTC" in timer)
+    check("开机补跑仍开启", "Persistent=true" in timer)
+
+
 def main() -> int:
     print("=" * 62)
     print("回归测试：每条对应一个真实踩过的坑")
@@ -308,6 +386,9 @@ def main() -> int:
     test_prob_up_is_bounded_and_monotone()
     test_batch_rate_limit_detection()
     test_no_constant_features_when_inputs_present()
+    test_domain_exclude_rules()
+    test_liquidity_gate_missing_data()
+    test_update_schedule_is_7am_beijing()
     print("\n" + "=" * 62)
     if FAIL:
         print(f"结果：{len(FAIL)} 项失败 → {FAIL}")

@@ -1,16 +1,24 @@
 [Unit]
-Description=Run skin-alpha pipeline daily at 02:00 UTC (10:00 Beijing)
+Description=Run skin-alpha pipeline daily at 23:00 UTC (07:00 Beijing)
 Documentation=https://github.com/BoGuYoYo/cs2-skin-quant
 
 [Timer]
-# UTC 02:00 = 北京时间 10:00。SteamDT 的日线数据在这个时间点已经稳定。
-OnCalendar=*-*-* 02:00:00 UTC
+# UTC 23:00 = 北京时间次日 07:00（用户 2026-10-11 改：早上七点左右开始更新）
+#
+# 为什么 07:00 也不会有"半天数据"的问题：
+#   SteamDT 的日线时间戳是 UTC 16:00 = 北京 00:00，即每根日线在北京时间
+#   零点开盘、次日零点封口。所以 07:00 触发时，前一天的日线已经完整封口
+#   （零点就已封口），07:00 只是把"开始跑"提前了 3 小时。
+#
+# 时间预算：一轮约 3.5 小时（其中 3.2 小时是 K 线采集 18853 个品种 × 0.6s），
+#   所以 07:00 启动 → 约 10:30 前数据落库（改之前是 10:00 启动 → 13:30）。
+OnCalendar=*-*-* 23:00:00 UTC
 Unit=skin-alpha-daily.service
 
 # 机器关机错过时间点后，开机补跑一次（日线数据断档的代价远大于补跑）
 Persistent=true
 
-# 随机延迟，避免和其他定时任务撞在整点
+# 随机延迟，避免和其他定时任务撞在整点（07:00 ~ 07:10 之间启动）
 RandomizedDelaySec=600
 
 [Install]
