@@ -23,6 +23,14 @@ MODE = os.environ.get("PUSH_MODE", "worker").strip().lower() or "worker"
 
 _VALID = {"local", "worker", "d1", "both", "none"}
 
+#: 不进 D1 的表。
+#: D1 免费额度只有 10 万行写入/天，而 kline 一次全量就是 150 万行 ——
+#: 直接推会把额度一次打满并触发 7500 错误（踩过）。
+#: 这些大表只写本地 SQLite，D1 只保留预测 / 告警 / 元数据这类「小结果」。
+D1_SKIP_STAGES = {
+    s.strip() for s in os.environ.get("D1_SKIP_STAGES", "kline,snap_daily").split(",") if s.strip()
+}
+
 
 def _worker():
     from . import to_cloudflare
@@ -85,11 +93,14 @@ def push(
             log.warning("Worker 通道失败（stage=%s）：%s", stage, e)
 
     if MODE in ("d1", "both"):
-        try:
-            total += _d1().push(stage, rows, replace_date=replace_date, replace_series=replace_series)
-        except Exception as e:
-            errors.append(f"d1: {e}")
-            log.warning("D1 通道失败（stage=%s）：%s", stage, e)
+        if stage in D1_SKIP_STAGES:
+            log.info("stage=%s 跳过 D1（大表，免费额度 10 万行/天，见 D1_SKIP_STAGES）", stage)
+        else:
+            try:
+                total += _d1().push(stage, rows, replace_date=replace_date, replace_series=replace_series)
+            except Exception as e:
+                errors.append(f"d1: {e}")
+                log.warning("D1 通道失败（stage=%s）：%s", stage, e)
 
     # 只要有一条通道成功就算成功（both 模式下 Cloudflare 挂了不该让管线失败）
     if errors and total == 0:

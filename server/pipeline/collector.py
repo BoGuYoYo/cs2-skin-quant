@@ -137,19 +137,24 @@ def write_daily_snapshot(con: sqlite3.Connection, blocks: Iterable[dict[str, Any
 
 
 def write_items(con: sqlite3.Connection, base: list[dict[str, Any]], now: int) -> int:
-    """用 /base 的返回填充 items 表（item_id 用平台 id，market_hash_name 做全局键）"""
+    """用 /base 的返回填充 items 表。
+
+    ⚠️ 主键必须用 market_hash_name，不能用平台的 goods_id。
+       踩过的坑：采集 / 特征 / 预测 / 回填全都拿 market_hash_name 当 item_id，
+       而这里原先写的是 BUFF goods_id（纯数字），导致 items 与
+       forecast / snap / kline 全都 JOIN 不上 —— 前端候选池的名字、图片全为 null。
+       平台的 itemId 属于映射信息，需要时再从 /base 取，不该混进主键。
+    """
     n = 0
     for it in base:
         mhn = it.get("marketHashName")
         if not mhn:
             continue
-        plats = it.get("platformList") or []
-        pid = next((p.get("itemId") for p in plats if p.get("name") == "BUFF"), None) or mhn
         con.execute(
             """INSERT OR REPLACE INTO items
                (item_id, name, market_hash_name, wear, case_id, case_name, image, updated_at)
                VALUES (?,?,?,?,?,?,?,?)""",
-            (str(pid), it.get("name"), mhn, _wear(mhn), None, None, None, now),
+            (mhn, it.get("name"), mhn, _wear(mhn), None, None, None, now),
         )
         n += 1
     con.commit()
