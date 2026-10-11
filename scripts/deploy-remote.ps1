@@ -39,7 +39,9 @@ function Say([string]$m, [string]$c = 'Gray') { Write-Host $m -ForegroundColor $
 function Head([string]$m) { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
 
 function Remote([string]$cmd, [switch]$IgnoreError) {
-    $out = ssh -o ConnectTimeout=20 -o BatchMode=yes -o ServerAliveInterval=15 $Server $cmd 2>&1
+    # 统一用 stdin 把脚本喂给远端 bash —— PowerShell 的引号转义会把
+    # 带 $() ' " 的命令拆得面目全非（踩过：整个命令被当成一条字符串传过去）
+    $out = $cmd | ssh -o ConnectTimeout=20 -o BatchMode=yes -o ServerAliveInterval=15 $Server "bash -s" 2>&1
     $code = $LASTEXITCODE
     if ($code -ne 0 -and -not $IgnoreError) {
         $script:Fail += "远程命令失败($code): $($cmd.Substring(0, [Math]::Min(60, $cmd.Length)))"
@@ -48,12 +50,8 @@ function Remote([string]$cmd, [switch]$IgnoreError) {
 }
 
 function RemoteScript([string]$name, [string]$body) {
-    # 通过 stdin 传脚本，避免多层引号转义地狱
-    $tmp = New-TemporaryFile
-    Set-Content -Path $tmp -Value $body -Encoding utf8NoBOM
-    $out = Get-Content $tmp -Raw | ssh -o ConnectTimeout=20 -o BatchMode=yes $Server "bash -s" 2>&1
+    $out = $body | ssh -o ConnectTimeout=20 -o BatchMode=yes $Server "bash -s" 2>&1
     $code = $LASTEXITCODE
-    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
     if ($code -ne 0) { $script:Fail += "$name 执行失败($code)" }
     return $out
 }

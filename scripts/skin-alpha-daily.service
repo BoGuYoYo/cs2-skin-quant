@@ -1,0 +1,29 @@
+[Unit]
+Description=skin-alpha daily pipeline
+Documentation=https://github.com/BoGuYoYo/cs2-skin-quant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=huangzefa
+Group=huangzefa
+WorkingDirectory=/opt/skin-alpha/server
+EnvironmentFile=/opt/skin-alpha/server/.env
+
+# 直接用 venv 里的 python，不 source activate（activate 在非交互环境下会出问题）
+ExecStart=/opt/skin-alpha/server/.venv/bin/python -m pipeline.run_daily
+
+StandardOutput=append:/var/log/skin-alpha/daily.log
+StandardError=append:/var/log/skin-alpha/daily.log
+
+# 采集 2000 品种要等 20 分钟限流，留足超时
+TimeoutStartSec=3600
+Restart=no
+
+# 加固：无特权提升、独立临时目录
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

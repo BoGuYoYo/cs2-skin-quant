@@ -189,8 +189,13 @@ def _endpoint() -> str:
     return f"{API_BASE}/accounts/{ACCOUNT_ID}/d1/database/{DATABASE_ID}/query"
 
 
-def _query(sql: str, params: list[Any] | None = None) -> int:
-    """执行一条语句，返回受影响行数"""
+def _post(sql: str, params: list[Any] | None = None) -> tuple[list[dict[str, Any]], int]:
+    """执行一条语句，返回 (结果行列表, 受影响行数)。
+
+    注意区分这两者：对 SELECT 而言 meta.changes 恒为 0，
+    所以「查行数」必须用返回值里的 results，不能用 changes
+    （之前 check() 用 changes 做探针，导致永远显示 0，看起来像空库）。
+    """
     body: dict[str, Any] = {"sql": sql}
     if params:
         body["params"] = params
@@ -217,7 +222,10 @@ def _query(sql: str, params: list[Any] | None = None) -> int:
             results = data.get("result") or []
             if results and not results[0].get("success", True):
                 raise D1Error(str(results[0].get("error") or results[0]))
-            return int((results[0].get("meta") or {}).get("changes", 0) or 0)
+
+            rows = (results[0].get("results") or []) if results else []
+            changes = int(((results[0].get("meta") or {}).get("changes", 0)) or 0)
+            return rows, changes
 
         except PayloadTooLarge:
             raise
@@ -229,6 +237,24 @@ def _query(sql: str, params: list[Any] | None = None) -> int:
             log.warning("D1 请求失败（第 %d 次）：%s，%ds 后重试", attempt, e, sleep)
             time.sleep(sleep)
     raise D1Error(f"D1 请求失败，已重试 {RETRIES} 次：{last}")
+
+
+def _query(sql: str, params: list[Any] | None = None) -> int:
+    """执行写语句，返回受影响行数"""
+    return _post(sql, params)[1]
+
+
+def fetch(sql: str, params: list[Any] | None = None) -> list[dict[str, Any]]:
+    """执行查询语句，返回结果行。
+
+    这是「读」的正确入口 —— 别再用 _query 读数据，它只会给你 0。
+    """
+    return _post(sql, params)[0]
+
+
+def fetch_one(sql: str, params: list[Any] | None = None) -> dict[str, Any] | None:
+    rows = fetch(sql, params)
+    return rows[0] if rows else None
 
 
 # ------------------------------------------------------------------ 对外接口
@@ -306,9 +332,16 @@ def push_many(items: dict[str, Sequence[dict[str, Any]]]) -> dict[str, int]:
 
 
 def check() -> dict[str, Any]:
-    """连通性自检：读一次 D1，确认 token 与库 ID 都对"""
-    n = _query("SELECT COUNT(*) AS n FROM items")
-    return {"ok": True, "database": DATABASE_ID, "items_probe": n}
+    """连通性自检：真的读一次 D1，确认 token 与库 ID 都对"""
+    row = fetch_one("SELECT COUNT(*) AS n FROM items")
+    n = int((row or {}).get("n", 0) or 0)
+    latest = fetch_one("SELECT MAX(date) AS d FROM forecast")
+    return {
+        "ok": True,
+        "database": DATABASE_ID,
+        "items": n,
+        "latest_forecast": (latest or {}).get("d"),
+    }
 
 
 # ------------------------------------------------------------------ 自检

@@ -1,30 +1,16 @@
-# /etc/systemd/system/skin-alpha-daily.service + .timer
-#
-# 每天北京时间 10:00（UTC 02:00）跑一次管线。
-# 与 Worker 的 Cron 时间对齐，但两者互不依赖：Worker 的 Cron 只做数据维护。
-
-# ---------------- skin-alpha-daily.service ----------------
 [Unit]
-Description=skin-alpha daily pipeline
-After=network-online.target
-
-[Service]
-Type=oneshot
-User=skinalpha
-WorkingDirectory=/opt/skin-alpha/server
-EnvironmentFile=/opt/skin-alpha/server/.env
-ExecStart=/opt/skin-alpha/server/.venv/bin/python -m pipeline.run_daily
-StandardOutput=append:/var/log/skin-alpha/daily.log
-StandardError=append:/var/log/skin-alpha/daily.log
-TimeoutStartSec=3600
-
-# ---------------- skin-alpha-daily.timer ----------------
-[Unit]
-Description=Run skin-alpha pipeline daily at 02:00 UTC
+Description=Run skin-alpha pipeline daily at 02:00 UTC (10:00 Beijing)
+Documentation=https://github.com/BoGuYoYo/cs2-skin-quant
 
 [Timer]
+# UTC 02:00 = 北京时间 10:00。SteamDT 的日线数据在这个时间点已经稳定。
 OnCalendar=*-*-* 02:00:00 UTC
+Unit=skin-alpha-daily.service
+
+# 机器关机错过时间点后，开机补跑一次（日线数据断档的代价远大于补跑）
 Persistent=true
+
+# 随机延迟，避免和其他定时任务撞在整点
 RandomizedDelaySec=600
 
 [Install]
