@@ -1,90 +1,367 @@
-"""服务器侧只读 API（可选组件）。
+"""skin-alpha 服务器端只读 API —— 与 Cloudflare Worker 的接口逐条对齐。
 
-什么时候需要它：
-  - 你想在网页上看到「算完模型但还没推送」的实时结果
-  - 你想用 Cloudflare Cron 反向触发服务器跑管线
-不需要的话，整个文件可以删掉 —— 主链路（管线 → /api/ingest → D1）完全不依赖它。
+为什么要有它：
+    反代到 Cloudflare 的 API 要 6~24 秒（跨境），体验不可接受。
+    服务器本地已有完整数据（SQLite），直读可以降到毫秒级，且完全不依赖 Cloudflare。
 
-部署：
-  uvicorn app:app --host 127.0.0.1 --port 8788
-  cloudflared tunnel --url http://127.0.0.1:8788     # 出站连接，不开任何入站端口
+设计：
+    响应格式与 Worker 完全一致（{"ok":true,"data":...}），
+    所以前端只需把 VITE_API_BASE 指过来，web/src/lib/api.ts 一行都不用改。
+
+启动：
+    uvicorn app:app --host 127.0.0.1 --port 8788
 """
 from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("api")
 
-app = FastAPI(title="skin-alpha server api", version="1.0.0")
+app = FastAPI(title="skin-alpha server api", version="2.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 TOKEN = os.environ.get("INGEST_TOKEN", "")
 HERE = Path(__file__).resolve().parent
+DB_PATH = Path(os.environ.get("DB_PATH", "./state/skins.db"))
+if not DB_PATH.is_absolute():
+    DB_PATH = HERE / DB_PATH
+
+
+# ---------------------------------------------------------------- 工具
+def db() -> sqlite3.Connection:
+    """只读连接 —— 这是自托管 API 快的关键。
+
+    用 mode=ro 而不是普通连接：WAL 模式下只读连接不需要写锁，
+    所以即使回填/采集正在写库，API 也不会被阻塞。
+    （踩过：用普通连接时，回填的长写事务会让 health 等待 15 秒后报 db down）
+    """
+    if not DB_PATH.exists():
+        raise HTTPException(503, f"本地库不存在：{DB_PATH}（管线还没跑过？）")
+    con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout=3000")
+    return con
+
+
+def rows_to_list(rows: Any) -> list[dict[str, Any]]:
+    return [dict(r) for r in rows]
+
+
+def ok(data: Any) -> dict[str, Any]:
+    return {"ok": True, "data": data}
 
 
 def _auth(authorization: str | None) -> None:
-    """Tunnel 暴露到公网，必须自己带鉴权 —— Cloudflare Access 是更省事的替代方案"""
     if not TOKEN:
         raise HTTPException(500, "INGEST_TOKEN 未在服务器上配置")
     if authorization != f"Bearer {TOKEN}":
         raise HTTPException(401, "unauthorized")
 
 
-@app.get("/health")
-def health():
-    db = HERE / os.environ.get("DB_PATH", "./state/skins.db")
+def _latest_date(con: sqlite3.Connection, table: str) -> str | None:
+    if table not in {"forecast", "snap_daily", "kline", "market_index", "backtest", "factor_latest"}:
+        raise HTTPException(400, "bad table")
+    r = con.execute(f"SELECT date FROM {table} ORDER BY date DESC LIMIT 1").fetchone()
+    return r["date"] if r else None
+
+
+SORT_COLS = {
+    "score": "f.score",
+    "q10": "f.q10_adj",
+    "prob": "f.prob_up",
+    "price": "fl.price",
+    "duration": "fl.drop_duration_days",
+    "rarity": "fl.case_rarity_score",
+    "turnover": "fl.turnover",
+}
+
+
+# ---------------------------------------------------------------- 端点
+@app.get("/api/health")
+def health() -> dict[str, Any]:
+    started = time.time()
+    db_state = "down"
+    counts: dict[str, int] = {}
+    try:
+        con = db()
+        n = con.execute("SELECT COUNT(*) AS n FROM items").fetchone()["n"]
+        db_state = "up" if n >= 0 else "down"
+        counts = {
+            "items": n,
+            "forecast": con.execute("SELECT COUNT(*) AS n FROM forecast").fetchone()["n"],
+            "kline": con.execute("SELECT COUNT(*) AS n FROM kline").fetchone()["n"],
+        }
+        con.close()
+    except Exception as e:
+        log.warning("health: %s", e)
+
     return {
         "ok": True,
-        "db_exists": db.exists(),
-        "db_size_mb": round(db.stat().st_size / 1e6, 2) if db.exists() else 0,
-        "model_exists": (HERE / os.environ.get("MODEL_PATH", "./state/model.pkl")).exists(),
-        "llm_enabled": bool(os.environ.get("LLM_API_KEY")),
+        "service": "skin-alpha",
+        "mode": "self-hosted",
+        "db": db_state,
+        "dbPath": str(DB_PATH),
+        "counts": counts,
+        "dbLatencyMs": int((time.time() - started) * 1000),
         "now": int(time.time()),
     }
 
 
-@app.get("/candidates/live")
-def candidates_live(
-    limit: int = Query(50, ge=1, le=500),
-    authorization: str | None = Header(default=None),
-):
-    """直接从服务器本地库读最新一天的预测（绕过 D1，用于实时对照）"""
-    _auth(authorization)
-    import sqlite3
+@app.get("/api/meta")
+def meta() -> dict[str, Any]:
+    con = db()
+    try:
+        meta_rows = con.execute("SELECT k, v FROM meta").fetchall()
+        day = _latest_date(con, "forecast")
+        counts = {
+            "items": con.execute("SELECT COUNT(*) AS n FROM items").fetchone()["n"],
+            "cases": con.execute("SELECT COUNT(*) AS n FROM case_meta").fetchone()["n"],
+            "forecast_today": con.execute(
+                "SELECT COUNT(*) AS n FROM forecast WHERE date = (SELECT MAX(date) FROM forecast)"
+            ).fetchone()["n"],
+            "alerts_total": con.execute("SELECT COUNT(*) AS n FROM alerts").fetchone()["n"],
+        }
+        return ok({"latestForecastDate": day, "meta": {r["k"]: r["v"] for r in meta_rows}, "counts": counts})
+    finally:
+        con.close()
 
-    db = HERE / os.environ.get("DB_PATH", "./state/skins.db")
-    if not db.exists():
-        raise HTTPException(404, "本地库不存在，管线还没跑过")
-    con = sqlite3.connect(str(db))
-    con.row_factory = sqlite3.Row
-    rows = con.execute(
-        """SELECT s.item_id, s.sell AS price, s.date
-             FROM snap s
-            WHERE s.date = (SELECT MAX(date) FROM snap)
-            ORDER BY s.sell DESC
-            LIMIT ?""",
-        (limit,),
-    ).fetchall()
-    con.close()
-    return {"ok": True, "rows": [dict(r) for r in rows]}
+
+@app.get("/api/progress")
+def progress() -> dict[str, Any]:
+    con = db()
+    try:
+        return ok(rows_to_list(con.execute(
+            "SELECT * FROM task_progress ORDER BY updated_at DESC LIMIT 20"
+        ).fetchall()))
+    finally:
+        con.close()
+
+
+@app.get("/api/market/index")
+def market_index(days: int = Query(365, ge=7, le=3000)) -> dict[str, Any]:
+    con = db()
+    try:
+        rows = con.execute(
+            "SELECT date, index_value, online_players, vol_turnover FROM market_index ORDER BY date DESC LIMIT ?",
+            (days,),
+        ).fetchall()
+        return ok(rows_to_list(reversed(rows)))
+    finally:
+        con.close()
+
+
+@app.get("/api/candidates")
+def candidates(
+    date: str | None = None,
+    limit: int = Query(50, ge=1, le=500),
+    side: str | None = None,
+    sort: str = "score",
+    dir: str = "desc",
+    rarityMin: float | None = None,
+) -> dict[str, Any]:
+    con = db()
+    try:
+        d = date or _latest_date(con, "forecast")
+        if not d:
+            return ok({"date": None, "rows": []})
+
+        where = ["f.date = ?"]
+        binds: list[Any] = [d]
+        if side:
+            where.append("f.side = ?")
+            binds.append(side)
+        if rarityMin is not None:
+            where.append("COALESCE(fl.case_rarity_score, 0) >= ?")
+            binds.append(rarityMin)
+        binds.append(limit)
+
+        order_col = SORT_COLS.get(sort, SORT_COLS["score"])
+        direction = "ASC" if dir.lower() == "asc" else "DESC"
+
+        sql = f"""
+            SELECT f.item_id, f.q10_adj, f.q50, f.q90_adj, f.prob_up, f.score, f.side, f.size, f.why,
+                   i.name, i.market_hash_name, i.image, i.case_name, i.wear,
+                   fl.price, fl.dd_from_high, fl.drop_duration_days, fl.turnover, fl.list_ratio,
+                   fl.case_rarity_score, fl.rel_ret_21d
+              FROM forecast f
+              LEFT JOIN items i ON i.item_id = f.item_id
+              LEFT JOIN factor_latest fl ON fl.item_id = f.item_id
+             WHERE {' AND '.join(where)}
+             ORDER BY {order_col} {direction}
+             LIMIT ?
+        """
+        return ok({"date": d, "rows": rows_to_list(con.execute(sql, binds).fetchall())})
+    finally:
+        con.close()
+
+
+@app.get("/api/screener")
+def screener(
+    priceMax: float = 100.0,
+    priceMin: float = 3.0,
+    turnoverMin: float = 0.002,
+    listRatioMax: float = 0.035,
+    rarityMin: float = 60.0,
+    limit: int = Query(100, ge=1, le=500),
+) -> dict[str, Any]:
+    con = db()
+    try:
+        rows = con.execute(
+            """SELECT fl.item_id, fl.price, fl.dd_from_high, fl.drop_duration_days, fl.ret_21d,
+                      fl.turnover, fl.list_ratio, fl.supply_peer_pct, fl.case_rarity_score,
+                      fl.supply_rigidity, i.name, i.case_name, i.image
+                 FROM factor_latest fl
+                 LEFT JOIN items i ON i.item_id = fl.item_id
+                WHERE fl.price BETWEEN ? AND ?
+                  AND COALESCE(fl.turnover, 0) >= ?
+                  AND COALESCE(fl.list_ratio, 0) <= ?
+                  AND COALESCE(fl.case_rarity_score, 0) >= ?
+                ORDER BY fl.case_rarity_score DESC, fl.drop_duration_days DESC
+                LIMIT ?""",
+            (priceMin, priceMax, turnoverMin, listRatioMax, rarityMin, limit),
+        ).fetchall()
+        return ok(rows_to_list(rows))
+    finally:
+        con.close()
+
+
+@app.get("/api/items/{item_id}")
+def item_detail(item_id: str) -> dict[str, Any]:
+    if not item_id:
+        raise HTTPException(400, "id required")
+    con = db()
+    try:
+        item = con.execute("SELECT * FROM items WHERE item_id = ?", (item_id,)).fetchone()
+        if not item:
+            raise HTTPException(404, "item not found")
+        factor = con.execute("SELECT * FROM factor_latest WHERE item_id = ?", (item_id,)).fetchone()
+        forecast = con.execute(
+            "SELECT * FROM forecast WHERE item_id = ? ORDER BY date DESC LIMIT 1", (item_id,)
+        ).fetchone()
+        kase = con.execute(
+            """SELECT cm.* FROM case_meta cm JOIN items i ON i.case_id = cm.case_id
+                WHERE i.item_id = ?""",
+            (item_id,),
+        ).fetchone()
+        alerts = con.execute(
+            "SELECT level, score, ts, detail FROM alerts WHERE item_id = ? ORDER BY ts DESC LIMIT 20",
+            (item_id,),
+        ).fetchall()
+        return ok({
+            "item": dict(item),
+            "factor": dict(factor) if factor else None,
+            "forecast": dict(forecast) if forecast else None,
+            "caseMeta": dict(kase) if kase else None,
+            "alerts": rows_to_list(alerts),
+        })
+    finally:
+        con.close()
+
+
+@app.get("/api/items/{item_id}/kline")
+def item_kline(item_id: str, days: int = Query(180, ge=7, le=2000)) -> dict[str, Any]:
+    con = db()
+    try:
+        rows = con.execute(
+            "SELECT date, o, h, l, c, v FROM kline WHERE item_id = ? ORDER BY date DESC LIMIT ?",
+            (item_id, days),
+        ).fetchall()
+        return ok(rows_to_list(reversed(rows)))
+    finally:
+        con.close()
+
+
+@app.get("/api/alerts")
+def alerts(limit: int = Query(100, ge=1, le=500), level: str | None = None) -> dict[str, Any]:
+    con = db()
+    try:
+        if level:
+            rows = con.execute(
+                "SELECT * FROM alert_view WHERE level = ? ORDER BY ts DESC LIMIT ?", (level, limit)
+            ).fetchall()
+        else:
+            rows = con.execute("SELECT * FROM alert_view ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+        return ok(rows_to_list(rows))
+    finally:
+        con.close()
+
+
+@app.get("/api/cases")
+def cases(limit: int = Query(100, ge=1, le=500), sort: str = "rarity") -> dict[str, Any]:
+    con = db()
+    try:
+        order = "case_volume_30d DESC" if sort == "volume" else "rarity_score DESC"
+        rows = con.execute(f"SELECT * FROM case_meta ORDER BY {order} LIMIT ?", (limit,)).fetchall()
+        return ok(rows_to_list(rows))
+    finally:
+        con.close()
+
+
+@app.get("/api/backtest")
+def backtest() -> dict[str, Any]:
+    con = db()
+    try:
+        return ok(rows_to_list(con.execute("SELECT * FROM backtest ORDER BY date ASC").fetchall()))
+    finally:
+        con.close()
+
+
+@app.get("/api/search")
+def search(q: str = Query("", max_length=60)) -> dict[str, Any]:
+    if len(q) < 2:
+        return ok([])
+    con = db()
+    try:
+        like = f"%{q}%"
+        rows = con.execute(
+            """SELECT item_id, name, market_hash_name, case_name, image FROM items
+                WHERE name LIKE ? OR market_hash_name LIKE ? LIMIT 30""",
+            (like, like),
+        ).fetchall()
+        return ok(rows_to_list(rows))
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------- 管理
+@app.post("/api/ingest")
+def ingest(payload: dict, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """本地写入入口（与 Worker 的 /api/ingest 同语义），便于其他服务推送"""
+    _auth(authorization)
+    stage = str(payload.get("stage", ""))
+    rows = payload.get("rows") or []
+    sys.path.insert(0, str(HERE))
+    from push import to_local
+
+    n = to_local.push(
+        stage, rows,
+        replace_date=payload.get("replaceDate"),
+        replace_series=payload.get("replaceSeries"),
+    )
+    return ok({"stage": stage, "inserted": n})
 
 
 @app.post("/admin/refresh")
-def admin_refresh(
-    payload: dict | None = None,
-    authorization: str | None = Header(default=None),
-):
-    """由 Cloudflare Cron 触发：后台跑一次完整管线"""
+def admin_refresh(payload: dict | None = None, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """触发一次完整管线（后台）"""
     _auth(authorization)
     log.info("收到刷新触发：%s", payload)
-    # 用 Popen 不阻塞响应；真实项目里换成队列或 systemd unit
     proc = subprocess.Popen(
         [sys.executable, "-m", "pipeline.run_daily"],
         cwd=str(HERE),
@@ -92,7 +369,7 @@ def admin_refresh(
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    return {"ok": True, "pid": proc.pid, "trigger": (payload or {}).get("trigger")}
+    return ok({"pid": proc.pid, "trigger": (payload or {}).get("trigger")})
 
 
 if __name__ == "__main__":

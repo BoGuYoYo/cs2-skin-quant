@@ -333,13 +333,24 @@ def collect_daily_kline(
 
 
 def load_history(con: sqlite3.Connection, days: int = 1200) -> pd.DataFrame:
-    """读取本地快照仓 → 宽表 DataFrame"""
+    """读取本地快照仓 → 宽表 DataFrame
+
+    注意：K 线回填只写价格，volume/supply/listings 都是 NULL。
+    pandas 会把整列 NULL 推断成 object，进而让 turnover = volume/supply 也是 object，
+    LightGBM 会直接拒绝（"pandas dtypes must be int, float or bool"）。
+    所以这里必须显式 to_numeric 兜住。
+    """
     df = pd.read_sql_query(
         "SELECT item_id, date, sell AS price, bid, listings, volume, supply FROM snap",
         con,
     )
     if df.empty:
         return df
+
+    for c in ("price", "bid", "listings", "volume", "supply"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
     df = df.dropna(subset=["price"])
     df["date"] = pd.to_datetime(df["date"])
     cutoff = df["date"].max() - pd.Timedelta(days=days)

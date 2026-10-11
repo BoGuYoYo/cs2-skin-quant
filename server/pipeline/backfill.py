@@ -59,6 +59,15 @@ SLEEP_PER_CALL = float(os.environ.get("KLINE_SLEEP", "0.6"))
 # 单个品种超过这个天数就认为已回填过，跳过（断点续传）
 SKIP_THRESHOLD_DAYS = 200
 
+# 每多少个品种 commit 一次。
+# 这里必须远小于日志间隔：回填每品种耗时约 0.6 秒，若 100 个才提交，
+# 一个写事务就长达 60 秒，会把 SQLite 写锁一直占住，
+# 导致同机的自托管 API 连接超时（踩过：health 等待 15 秒后报 db down）。
+COMMIT_EVERY = int(os.environ.get("BACKFILL_COMMIT_EVERY", "10"))
+
+# 每多少个品种打一次日志 / 上报一次进度
+LOG_EVERY = int(os.environ.get("BACKFILL_LOG_EVERY", "100"))
+
 
 def reload_names(con: sqlite3.Connection) -> list[str]:
     """监控池 —— 统一来自 collector.WATCHLIST_SQL（只保留可交易品种）"""
@@ -204,18 +213,20 @@ def main() -> int:
             fail += 1
             log.debug("  %s → %s", name[:40], e)
 
-        if i % 100 == 0:
+        if i % COMMIT_EVERY == 0:
             con.commit()
-            elapsed = time.time() - t0
-            rate = i / elapsed * 60
-            eta = (len(todo) - i) / max(rate, 1e-6)
-            log.info("进度 %d/%d（%.1f%%）成功 %d 空 %d 失败 %d 行数 %d | %.0f 个/分钟 | 剩余 %.0f 分钟",
-                     i, len(todo), i / len(todo) * 100, ok, empty, fail, total_rows, rate, eta)
-            if task_progress:
-                task_progress.report(
-                    "backfill", "running",
-                    **task_progress.progress_fields(i, len(todo), t0, ok, empty, fail, total_rows, started_at),
-                )
+            if i % LOG_EVERY == 0:
+                elapsed = time.time() - t0
+                rate = i / elapsed * 60
+                eta = (len(todo) - i) / max(rate, 1e-6)
+                log.info("进度 %d/%d（%.1f%%）成功 %d 空 %d 失败 %d 行数 %d | %.0f 个/分钟 | 剩余 %.0f 分钟",
+                         i, len(todo), i / len(todo) * 100, ok, empty, fail, total_rows, rate, eta)
+                if task_progress:
+                    task_progress.report(
+                        "backfill", "running",
+                        **task_progress.progress_fields(i, len(todo), t0, ok, empty, fail,
+                                                        total_rows, started_at),
+                    )
         time.sleep(SLEEP_PER_CALL)
 
     con.commit()
