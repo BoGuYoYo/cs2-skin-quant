@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -195,6 +196,111 @@ WATCHLIST_SQL = """
 def load_watchlist(con: sqlite3.Connection) -> list[str]:
     """监控池 = 可交易的武器皮肤 + 探员（排除不可交易道具）"""
     return [r[0] for r in con.execute(WATCHLIST_SQL).fetchall()]
+
+
+# --------------------------------------------------------------- K 线接口
+KLINE_URL = f"{STEAMDT_BASE}/open/cs2/item/v1/kline"
+
+#: type 参数：1=小时线(2160条/90天)  2=日线(365条/1年)  3=周线(224条/6年)
+KLINE_TYPE_HOUR = 1
+KLINE_TYPE_DAY = 2
+KLINE_TYPE_WEEK = 3
+
+
+def fetch_kline(
+    session: requests.Session,
+    api_key: str,
+    market_hash_name: str,
+    ktype: int = KLINE_TYPE_DAY,
+    platform: str = "BUFF",
+) -> list[list]:
+    """拉一段 K 线。返回 [[ts, open, high, low, close], ...]，权限 120 次/分钟。"""
+    r = session.post(
+        KLINE_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={"marketHashName": market_hash_name, "type": ktype, "platform": platform},
+        timeout=45,
+    )
+    if r.status_code == 429:
+        raise RuntimeError("RATE_LIMIT")
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    j = r.json()
+    if not j.get("success"):
+        raise RuntimeError(f"API {j.get('errorCode')}: {j.get('errorMsg')}")
+    data = j.get("data")
+    return data if isinstance(data, list) else []
+
+
+def write_kline_rows(con: sqlite3.Connection, item_id: str, rows: list) -> int:
+    """K 线行 → snap 表（只填价格，bid/listings/supply 留空由价格接口补）"""
+    n = 0
+    for row in rows:
+        try:
+            ts = int(row[0])
+            close = float(row[4])
+        except (IndexError, TypeError, ValueError):
+            continue
+        day = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        con.execute(
+            "INSERT OR REPLACE INTO snap (item_id, date, sell, bid, listings, volume, supply, ts) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (item_id, day, close, None, None, None, None, ts),
+        )
+        n += 1
+    return n
+
+
+def collect_daily_kline(
+    con: sqlite3.Connection,
+    session: requests.Session,
+    api_key: str,
+    names: list[str],
+    platform: str = "BUFF",
+    sleep: float = 0.6,
+    log_every: int = 200,
+) -> dict[str, int]:
+    """日常采集走 K 线接口。
+
+    相比 /price/batch 的两个优势：
+      1) 配额 120 次/分钟（batch 只有 1 次/分钟）→ 18853 个品种约 3 小时，batch 要 3.2 小时且更容易撞限额
+      2) 一次返回整段历史，能自动补齐前几天漏掉的日期（batch 只有当前快照）
+    """
+    import time as _time
+
+    stats = {"ok": 0, "empty": 0, "fail": 0, "rows": 0}
+    t0 = _time.time()
+    for i, name in enumerate(names, 1):
+        try:
+            rows = fetch_kline(session, api_key, name, KLINE_TYPE_DAY, platform)
+            n = write_kline_rows(con, name, rows)
+            if n:
+                stats["ok"] += 1
+                stats["rows"] += n
+            else:
+                stats["empty"] += 1
+        except RuntimeError as e:
+            if "RATE_LIMIT" in str(e):
+                log.warning("触发限流，退避 65 秒")
+                _time.sleep(65)
+                continue
+            stats["fail"] += 1
+        except Exception:
+            stats["fail"] += 1
+
+        if i % log_every == 0:
+            con.commit()
+            el = _time.time() - t0
+            log.info("K线采集 %d/%d（%.1f%%）成功 %d 空 %d 失败 %d 行 %d | %.0f 个/分钟 | 剩余 %.0f 分钟",
+                     i, len(names), i / len(names) * 100, stats["ok"], stats["empty"],
+                     stats["fail"], stats["rows"], i / el * 60,
+                     (len(names) - i) / max(i / el, 1e-9) / 60)
+        _time.sleep(sleep)
+
+    con.commit()
+    log.info("K线采集完成：成功 %d 空 %d 失败 %d，写入 %d 行，耗时 %.1f 分钟",
+             stats["ok"], stats["empty"], stats["fail"], stats["rows"], (_time.time() - t0) / 60)
+    return stats
 
 
 def load_history(con: sqlite3.Connection, days: int = 1200) -> pd.DataFrame:

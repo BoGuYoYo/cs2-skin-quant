@@ -199,21 +199,27 @@ def run(dry_run: bool = False, backtest_only: bool = False) -> int:
             log.error("base 同步失败：%s", e)
             return 3
 
-    log.info("监控池 %d 个武器皮肤（已排除印花/涂鸦/挂件等）", len(watchlist))
+    log.info("监控池 %d 个可交易品种（武器皮肤 + 探员）", len(watchlist))
 
-    # 采集规模：SteamDT 的 /price/batch 限流 1 次/分钟 × 100 个品种。
-    #   2000 个   → 20 次请求  → 约 20 分钟
-    #   18826 个  → 189 次请求 → 约 3.2 小时
-    #   44497 全量 → 445 次请求 → 约 7.5 小时
-    # WATCH_LIMIT=0 表示不限量（全池）。
-    limit = int(os.environ.get("WATCH_LIMIT", "2000"))
+    # WATCH_LIMIT=0 表示不限量。
+    limit = int(os.environ.get("WATCH_LIMIT", "0"))
     pool = watchlist if limit <= 0 else watchlist[:limit]
-    log.info("本轮采集 %d 个（WATCH_LIMIT=%s，预计 %.0f 分钟）",
-             len(pool), "不限" if limit <= 0 else limit, len(pool) / 100 * 61 / 60)
+
+    # 采集通道：
+    #   kline（默认）= /open/cs2/item/v1/kline，120 次/分钟，一次拿整段历史（能补漏掉的日期）
+    #   batch       = /price/batch，1 次/分钟 × 100 个，只有当前快照
+    mode = os.environ.get("COLLECT_MODE", "kline").strip().lower()
     try:
-        blocks = collector.fetch_prices(pool, key, session)
-        n = collector.write_daily_snapshot(con, blocks, day)
-        log.info("写入当日快照 %d 行", n)
+        if mode == "batch":
+            log.info("采集[batch] %d 个，预计 %.0f 分钟", len(pool), len(pool) / 100 * 61 / 60)
+            blocks = collector.fetch_prices(pool, key, session)
+            n = collector.write_daily_snapshot(con, blocks, day)
+            log.info("写入当日快照 %d 行", n)
+        else:
+            log.info("采集[kline] %d 个，预计 %.0f 分钟", len(pool), len(pool) * 0.6 / 60)
+            stats = collector.collect_daily_kline(con, session, key, pool)
+            log.info("K线采集结果：成功 %d / 空 %d / 失败 %d / 写入 %d 行",
+                     stats["ok"], stats["empty"], stats["fail"], stats["rows"])
     except Exception as e:
         fails.append(f"采集失败: {e}")
         log.error("采集失败：%s", e)
