@@ -133,14 +133,10 @@ def _push_cold_start(con, cfg: Cfg, day: str, now_ts: int, hist, reason: str) ->
     也让你能提前验证采集链路是否稳定。
     """
     try:
-        kline_df = make_kline(hist)
-        kline_rows = [
-            {"item_id": r.item_id, "date": r.date.strftime("%Y-%m-%d"),
-             "o": float(r.o), "h": float(r.h), "l": float(r.l), "c": float(r.c),
-             "v": int(r.v) if pd.notna(r.v) else None}
-            for r in kline_df.itertuples()
-        ] if not kline_df.empty else []
-
+        # 注意：这里**不再**生成/推送 kline。
+        # 采集阶段（collector.collect_daily_kline）已经把 K 线原始 OHLC 写进 kline 表了；
+        # 而 make_kline 是从 snap 的单点价格反推 o=h=l=c 的假 OHLC，
+        # 推上去会用假数据覆盖真数据（踩过）。
         item_rows = [
             {"item_id": r[0], "name": r[1], "market_hash_name": r[2], "wear": r[3],
              "case_id": r[4], "case_name": r[5], "image": r[6], "updated_at": now_ts}
@@ -152,7 +148,6 @@ def _push_cold_start(con, cfg: Cfg, day: str, now_ts: int, hist, reason: str) ->
 
         plan = [
             ("items", item_rows, {}),
-            ("kline", kline_rows, {}),
             ("meta", [
                 {"k": "model_version", "v": f"{cfg.model_version}-coldstart", "updated_at": now_ts},
                 {"k": "last_run", "v": day, "updated_at": now_ts},
@@ -161,13 +156,13 @@ def _push_cold_start(con, cfg: Cfg, day: str, now_ts: int, hist, reason: str) ->
                 {"k": "snap_rows", "v": str(len(hist)), "updated_at": now_ts},
             ], {}),
             ("runs", [
-                {"ts": now_ts, "stage": "daily-coldstart", "ok": 1, "rows": len(kline_rows),
+                {"ts": now_ts, "stage": "daily-coldstart", "ok": 1, "rows": len(item_rows),
                  "message": f"冷启动采集 {len(hist)} 行快照；预测已跳过"},
             ], {}),
         ]
         for stage, rows, kw in plan:
             dispatch.push(stage, rows, **kw)
-        log.info("冷启动基础数据已推送：items %d / kline %d", len(item_rows), len(kline_rows))
+        log.info("冷启动基础数据已推送：items %d（kline 由采集阶段写入）", len(item_rows))
     except Exception as e:
         log.error("冷启动推送失败：%s", e)
 
@@ -366,14 +361,8 @@ def run(dry_run: bool = False, backtest_only: bool = False) -> int:
         return 0
 
     # ---------------- 6. 推送 ----------------
-    kline_df = make_kline(hist)
-    kline_rows = [
-        {"item_id": r.item_id, "date": r.date.strftime("%Y-%m-%d"),
-         "o": float(r.o), "h": float(r.h), "l": float(r.l), "c": float(r.c),
-         "v": int(r.v) if pd.notna(r.v) else None}
-        for r in kline_df.itertuples()
-    ] if not kline_df.empty else []
-
+    # 不推 kline：采集阶段已把原始 OHLC 写进 kline 表，
+    # 而 make_kline 只能从 snap 单点反推 o=h=l=c，推上去会用假 OHLC 覆盖真数据（踩过）。
     item_rows = [
         {"item_id": r[0], "name": r[1], "market_hash_name": r[2], "wear": r[3],
          "case_id": r[4], "case_name": r[5], "image": r[6], "updated_at": now_ts}
@@ -399,7 +388,6 @@ def run(dry_run: bool = False, backtest_only: bool = False) -> int:
             ("factor_latest", factor_rows, {}),
             ("forecast", forecast_rows, {"replace_date": day}),
             ("alerts", alert_rows, {}),
-            ("kline", kline_rows, {}),
             (
                 "meta",
                 [

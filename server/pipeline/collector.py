@@ -242,21 +242,36 @@ def fetch_kline(
     return data if isinstance(data, list) else []
 
 
-def write_kline_rows(con: sqlite3.Connection, item_id: str, rows: list) -> int:
-    """K 线行 → snap 表（只填价格，bid/listings/supply 留空由价格接口补）"""
+def write_kline_rows(con: sqlite3.Connection, item_id: str, rows: list, write_kline: bool = True) -> int:
+    """K 线行 → snap（价格）+ kline（完整 OHLC）
+
+    ⚠️ 字段顺序是 [ts, open, close, high, low]，**不是** [ts, o, h, l, c]。
+       踩过的坑：把 row[4] 当成 close，实际那是 low —— 结果 150 万行历史价格
+       全被记成「当日最低价」，与实盘系统性偏低。判据：字段顺序为 [o,h,l,c] 时
+       会出现 high < low 的矛盾；按 [o,c,h,l] 解释则 6/6 条都满足
+       high >= max(o,c) 且 low <= min(o,c)，且 close 与实时在售价完全一致。
+
+    ⚠️ 时间戳是 UTC 16:00（= 北京时间 00:00）。必须按北京时间归日，
+       否则整条序列偏移一天（踩过：10-10 的数据被记成 10-09）。
+    """
     n = 0
     for row in rows:
         try:
             ts = int(row[0])
-            close = float(row[4])
+            o, c, h, l = float(row[1]), float(row[2]), float(row[3]), float(row[4])
         except (IndexError, TypeError, ValueError):
             continue
-        day = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        day = datetime.fromtimestamp(ts + 8 * 3600, tz=timezone.utc).strftime("%Y-%m-%d")
         con.execute(
             "INSERT OR REPLACE INTO snap (item_id, date, sell, bid, listings, volume, supply, ts) "
             "VALUES (?,?,?,?,?,?,?,?)",
-            (item_id, day, close, None, None, None, None, ts),
+            (item_id, day, c, None, None, None, None, ts),
         )
+        if write_kline:
+            con.execute(
+                "INSERT OR REPLACE INTO kline (item_id, date, o, h, l, c, v) VALUES (?,?,?,?,?,?,?)",
+                (item_id, day, o, h, l, c, None),
+            )
         n += 1
     return n
 

@@ -93,22 +93,13 @@ def fetch_kline(session: requests.Session, api_key: str, name: str, ktype: int, 
 
 
 def write_kline(con: sqlite3.Connection, item_id: str, rows: list) -> int:
-    """K 线行 [ts, open, high, low, close] → snap 表（只填价格，其余字段留空）"""
-    n = 0
-    for row in rows:
-        try:
-            ts = int(row[0])
-            close = float(row[4])
-        except (IndexError, TypeError, ValueError):
-            continue
-        day = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
-        con.execute(
-            "INSERT OR REPLACE INTO snap (item_id, date, sell, bid, listings, volume, supply, ts) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (item_id, day, close, None, None, None, None, ts),
-        )
-        n += 1
-    return n
+    """转发到 collector.write_kline_rows —— 只保留一份实现，避免两边漂移。
+
+    这里原先有一份独立实现，字段顺序解析是错的（把 low 当成了 close），
+    导致 150 万行历史价格全被记成当日最低价。修的时候得同时改两处、极易漏 ——
+    所以统一到 collector 一处。
+    """
+    return collector.write_kline_rows(con, item_id, rows, write_kline=True)
 
 
 def status(con: sqlite3.Connection) -> None:
