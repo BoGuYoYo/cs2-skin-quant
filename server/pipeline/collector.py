@@ -54,6 +54,21 @@ CREATE TABLE IF NOT EXISTS events (
   affected_cases TEXT, direction TEXT, magnitude INTEGER,
   horizon_days INTEGER, confidence REAL, evidence TEXT, reasoning TEXT
 );
+-- meta：少量键值状态（目前只有挂单量采集的断点游标）。
+--
+-- 必须在 collector 自己的 SCHEMA 里建，不能指望 to_local.ensure_schema：
+-- 后者只在「发生一次推送」时才会跑，而「items 已落地、还没发生过推送」的
+-- 半初始化库是真实存在的（首次 run_daily 在 base 同步写入 items 之后、
+-- 首次 push 之前被杀掉就会留下这种库；机器上 4G 内存，OOM 杀过不止一次）。
+--
+-- 踩过的坑：漏建 meta 时，collect_listings 每写完一批就抛
+-- OperationalError: no such table: meta —— 游标永远存不下去，采集器
+-- 写完第一批 100 个品种就死、systemd 拉起来又死，永远卡在第一批；
+-- 而流动性闸门按「不知道就放行」的设计照常工作，从看板上完全看不出
+-- 采集器在崩。崩溃与静默失效同时发生，这是最难查的一类。
+CREATE TABLE IF NOT EXISTS meta (
+  k TEXT PRIMARY KEY, v TEXT, updated_at INTEGER NOT NULL
+);
 """
 
 
@@ -250,12 +265,26 @@ def _meta_get(con: sqlite3.Connection, k: str, default: str | None = None) -> st
 
 
 def _meta_set(con: sqlite3.Connection, k: str, v: str) -> None:
-    con.execute(
-        "INSERT INTO meta (k, v, updated_at) VALUES (?,?,?) "
-        "ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at",
-        (k, v, int(time.time())),
-    )
-    con.commit()
+    """存游标。
+
+    ⚠️ 失败不能让采集停摆：游标只是「省点重复劳动」的优化，丢了顶多下次
+    从旧位置重跑一遍（SNAP_UPSERT 是幂等的，重复写不会出错）。
+    所以这里兜住异常、吼一声继续跑，而不是让整轮采集崩掉。
+
+    踩过的坑（两层）：meta 表曾经不在 collector.SCHEMA 里 → 这里每批都抛
+    OperationalError → 采集器写完第一批就死、systemd 拉起又死；而流动性闸门
+    因为「没数据就放行」照常显示正常，看板上完全看不出采集器在崩。
+    Schema 已补上（根因）；这层兜底是第二道防线。
+    """
+    try:
+        con.execute(
+            "INSERT INTO meta (k, v, updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at",
+            (k, v, int(time.time())),
+        )
+        con.commit()
+    except sqlite3.Error as e:
+        log.warning("游标保存失败（%s=%s）：%s —— 本轮继续，下次会从旧位置重跑", k, v, e)
 
 
 def collect_listings(

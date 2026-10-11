@@ -228,13 +228,6 @@ def walk_forward(df: pd.DataFrame, cfg: Cfg) -> tuple[pd.DataFrame, dict[str, fl
     )
     return pd.DataFrame(rows), base
 
-    y_all = d["y"].to_numpy()
-    base = {
-        f"pinball_{tau}": pinball(y_all, np.full_like(y_all, np.quantile(y_all, tau)), tau)
-        for tau in cfg.quantiles
-    }
-    return pd.DataFrame(rows), base
-
 
 def acceptance(metrics: pd.DataFrame, base: dict[str, float]) -> tuple[bool, list[str]]:
     """验收标准：跑不过这一关就不要上实盘"""

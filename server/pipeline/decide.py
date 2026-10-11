@@ -6,6 +6,14 @@
 
 分位数回归的全部意义在 B 里的第一条：P10 折算回来还亏 → 直接排除。
 点预测做不到这件事，它只会告诉你「预期 +18%」，然后你在尾部亏掉本金。
+
+⚠️ 曾经在这里设计、但**从未接入**的三个函数已删除（需要时从 git 历史取回）：
+    tranche()      分批建仓节奏（越接近 28 天跌势越接近满仓）
+    in_cooldown()  告警冷却（同一标的不在 N 小时内重复提醒）
+    confirm()      闪崩二次确认（要求连续 confirm_n 个采样点都达标）
+截断而不是留着：无人调用的函数会随依赖（cfg 字段、numpy API）一起烂掉，
+而且让人以为「分批建仓/冷却/二次确认」已经生效了 —— 实际上线上一次都没跑过。
+要接的话，注意 decide() 目前是一次性满仓输出，冷却也没有落地到 alerts 表。
 """
 from __future__ import annotations
 
@@ -141,21 +149,3 @@ def decide(row: dict[str, Any], cfg: Cfg) -> dict[str, Any]:
         "why": (f"P10 {math.expm1(p10):+.1%} / P50 {math.expm1(p50):+.1%} / P90 {math.expm1(p90):+.1%}"
                 f"，赔率 {ratio:.2f}，仓位 {size:.2%}{fit_note}"),
     }
-
-
-def tranche(days_in_drop: float | None, size: float, lo: int = 7, hi: int = 28) -> float:
-    """分批建仓节奏：越靠近你经验窗口的上沿（28 天），越接近满仓"""
-    if days_in_drop is None or _nan(days_in_drop):
-        return size * 0.5
-    f = float(np.clip((float(days_in_drop) - lo) / max(hi - lo, 1), 0.0, 1.0))
-    return size * f
-
-
-def in_cooldown(last_ts: int | None, now_ts: int, level: str, cfg: Cfg) -> bool:
-    cd_hours = next((cd for lv, _d, _z, cd in cfg.levels if lv == level), 6)
-    return last_ts is not None and (now_ts - last_ts) < cd_hours * 3600
-
-
-def confirm(df_tail: np.ndarray, level: str, cfg: Cfg) -> bool:
-    """确认点：要求连续 confirm_n 个采样点都达到该等级，过滤瞬时闪崩"""
-    return len(df_tail) >= cfg.confirm_n and bool(np.all(df_tail[-cfg.confirm_n :] >= 1))

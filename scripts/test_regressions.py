@@ -449,6 +449,104 @@ def test_weapon_exclusion_sql() -> None:
           not killed, f"误杀：{killed}")
 
 
+def test_meta_table_and_cursor() -> None:
+    """collector 必须建出它自己写的表（meta），且游标存不下不能让采集停摆。
+
+    当时症状：collector.SCHEMA 里没有 meta，而 _meta_set 每批都
+    INSERT INTO meta → collect_listings 写完第一批 100 个品种就抛
+    OperationalError 崩掉、systemd 拉起又死，游标永远归零；
+    而流动性闸门按「没数据就放行」的设计照常工作 —— 崩溃与静默失效
+    同时发生，看板上完全看不出采集器一直在崩。
+    """
+    print("\n[15] meta 表与断点游标")
+    import tempfile  # noqa: PLC0415
+
+    check("collector.SCHEMA 自己建 meta（不指望 to_local.ensure_schema）",
+          "CREATE TABLE IF NOT EXISTS meta" in collector.SCHEMA)
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "fresh.db")
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        check("只有 collector 碰过的库里也有 meta", "meta" in tables, f"tables={sorted(tables)}")
+
+        collector._meta_set(con, collector.LISTINGS_CURSOR_KEY, "700")
+        check("游标写入后能读回",
+              collector._meta_get(con, collector.LISTINGS_CURSOR_KEY) == "700")
+
+        # 第二道防线：就算 meta 真被删了，也不该让整轮采集崩掉
+        con.execute("DROP TABLE meta")
+        con.commit()
+        raised = False
+        try:
+            collector._meta_set(con, collector.LISTINGS_CURSOR_KEY, "800")
+        except Exception as e:      # noqa: BLE001
+            raised = True
+            print(f"      抛出了：{type(e).__name__}: {e}")
+        check("meta 缺失时 _meta_set 只告警不抛异常", not raised,
+              "游标是省重复劳动的优化，不是核心数据（UPSERT 幂等，丢了重跑即可）")
+        con.close()
+
+
+def test_notify_digest_uses_simple_returns() -> None:
+    """手机摘要里的 P10/P50 必须换算成简单收益再打印。
+
+    当时症状：notify_digest 写 f"{c['p10']:+.1%}"，把**对数**收益当百分比 ——
+    log=-0.818（真实亏 55.9%）会显示成 -81.8%，库里最负的 log=-2.7181
+    会显示成 -271.8%（比本金全亏还夸张）。终端与前端都做对了换算，
+    只有手机这条通道错 —— 而它恰恰是你不在电脑前时唯一的读数渠道。
+    """
+    print("\n[16] 通知摘要的收益口径")
+    import push.notify as notify  # noqa: PLC0415
+
+    got = notify.log_to_simple_pct(-0.818)
+    check("log_to_simple_pct 是 expm1（不是直接 ×100）",
+          abs(got - (math.expm1(-0.818) * 100)) < 1e-9, f"log=-0.818 -> {got:.2f}%")
+
+    captured: list[str] = []
+    orig = (notify._bark, notify._wecom, notify._feishu)
+    notify._bark = lambda title, body, level: (captured.append(body), True)[1]   # type: ignore[assignment]
+    notify._wecom = lambda title, body: (captured.append(body), True)[1]        # type: ignore[assignment]
+    notify._feishu = lambda title, body: (captured.append(body), True)[1]       # type: ignore[assignment]
+    try:
+        notify.notify_digest("2026-10-11", [
+            {"name": "测试标的", "price": 12.5, "p10": -0.818, "p50": -0.5, "size": 0.02},
+        ])
+    finally:
+        notify._bark, notify._wecom, notify._feishu = orig   # type: ignore[assignment]
+
+    body = captured[0] if captured else ""
+    check("P10 打印真实的 -55.9%，不是 -81.8%",
+          "-55.9%" in body and "-81.8%" not in body, body[:90])
+    check("P50 打印真实的 -39.3%", "-39.3%" in body, body[:90])
+
+
+def test_source_guards_for_fixed_bugs() -> None:
+    """源码层面的守卫：已修的问题不许以任何形式复活。"""
+    print("\n[17] 源码回归守卫")
+    rd = (SERVER / "pipeline" / "run_daily.py").read_text(encoding="utf-8")
+    md = (SERVER / "pipeline" / "model.py").read_text(encoding="utf-8")
+    # 去掉注释行再查：几处注释里**故意**写着旧写法的原文（说明这次踩的坑），
+    # 直接全文匹配会误报。
+    rd_code = "\n".join(ln for ln in rd.splitlines() if not ln.strip().startswith("#"))
+
+    check("冷启动推送不再拿 market_hash_name 去比 snap.item_id",
+          "market_hash_name IN (SELECT DISTINCT item_id FROM snap)" not in rd_code)
+    check("walk_forward 不再用全样本分位数当基线（那正是泄漏口径）",
+          "np.quantile(y_all" not in md)
+    check("walk_forward 的 return 之后不留死代码",
+          md.count("return pd.DataFrame(rows), base") == 1)
+
+    allsrc = "\n".join(
+        (SERVER / p).read_text(encoding="utf-8")
+        for p in ("pipeline/run_daily.py", "pipeline/decide.py", "pipeline/cases.py",
+                  "pipeline/model.py", "push/to_d1.py")
+    )
+    for name in ("def make_kline", "def tranche(", "def in_cooldown(", "def confirm(",
+                 "def score_cases_llm(", "def write_cases(", "def collect_case_metrics(",
+                 "def score_cases_rule_based(", "_TABLE_MAP = {"):
+        check(f"死代码已移除：{name}", name not in allsrc)
+
+
 def main() -> int:
     print("=" * 62)
     print("回归测试：每条对应一个真实踩过的坑")
@@ -467,6 +565,9 @@ def main() -> int:
     test_weapon_exclusion_sql()
     test_liquidity_gate_missing_data()
     test_update_schedule_is_7am_beijing()
+    test_meta_table_and_cursor()
+    test_notify_digest_uses_simple_returns()
+    test_source_guards_for_fixed_bugs()
     print("\n" + "=" * 62)
     if FAIL:
         print(f"结果：{len(FAIL)} 项失败 → {FAIL}")

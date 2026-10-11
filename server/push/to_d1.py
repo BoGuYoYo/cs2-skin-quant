@@ -314,20 +314,14 @@ def push(
             log.warning("stage=%s 语句过大，SQL 长度上限降到 %d 字节后重试", stage, limit)
 
 
-_TABLE_MAP = {
-    "items": "items", "case_meta": "case_meta", "snap_daily": "snap_daily",
-    "kline": "kline", "forecast": "forecast", "factor_latest": "factor_latest",
-    "alerts": "alerts", "market_index": "market_index", "backtest": "backtest",
-    "meta": "meta", "runs": "runs",
-}
-
-
 def _table_of(stage: str) -> str:
     """表名与 stage 名一一对应 —— 直接用 stage 当表名。
 
-    以前这里维护了一份 _TABLE_MAP，加新表时容易漏改（踩过：加了 task_progress
-    到 STAGES 但忘了加映射，运行时报 KeyError）。stage 本身已在 STAGES 里做过
-    白名单校验，所以这里直接返回是安全的。
+    这里曾经维护过一份 _TABLE_MAP 映射表，加新表时容易漏改
+    （踩过：加了 task_progress 到 STAGES 但忘了加映射，运行时报 KeyError）。
+    stage 本身已在 STAGES 里做过白名单校验，所以直接返回是安全的。
+    那份映射表因为已经没有任何调用方（死代码，还会让人以为改表名要来这里）
+    而被删除 —— 需要时从 git 历史取回。
     """
     return stage
 

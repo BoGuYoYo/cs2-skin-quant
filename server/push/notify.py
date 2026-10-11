@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 
 import requests
@@ -16,6 +17,20 @@ WECOM = os.environ.get("WECOM_URL", "")
 FEISHU = os.environ.get("FEISHU_URL", "")
 
 ICON = {"L1": "🟡", "L2": "🟠", "L3": "🔴"}
+
+
+def log_to_simple_pct(v: float) -> float:
+    """对数净收益 → 简单净收益百分比。**全系统只此一处实现。**
+
+    为什么值当单独抽一个函数：「对数还是简单收益」是这个项目反复踩的坑。
+    forecast 表里的 q10_adj / q50 / q90_adj 都是**对数净收益**，
+    直接按百分比打印会严重夸大亏损 —— log=-2.7181 真实是亏 93.4%，
+    当百分比打出来却是 -271.8%（比本金全亏还夸张）。
+
+    前端的对应实现是 web/src/lib/format.ts 的 logPct()，两边必须一致；
+    run_daily._print_top（终端）与 notify_digest（手机）也都用这个函数。
+    """
+    return math.expm1(float(v)) * 100.0
 
 
 def _bark(title: str, body: str, level: str) -> bool:
@@ -86,9 +101,21 @@ def notify_item(name: str, level: str, price: float, detail: str, link: str = ""
 
 
 def notify_digest(date: str, candidates: list[dict], fails: list[str] | None = None) -> bool:
-    """每日候选池摘要"""
-    lines = [f"- {c['name']} ¥{c['price']:.2f} · P10 {c['p10']:+.1%} · P50 {c['p50']:+.1%} · 仓位 {c['size']:.2%}"
-             for c in candidates[:15]]
+    """每日候选池摘要
+
+    ⚠️ p10 / p50 是**对数净收益**，必须过 log_to_simple_pct 再打印。
+    踩过的坑：原先写 f"{c['p10']:+.1%}"，把对数当百分比 ——
+    于是「真实亏 55.9%」的单子在手机上显示成「-81.8%」，
+    而 P10 恰恰是整套设计最倚重的那个数（下沿都亏就不碰），
+    却是唯一一个你不在电脑前时阅读的渠道。终端和前端都是对的，只有手机错。
+    """
+    lines = [
+        f"- {c['name']} ¥{c['price']:.2f}"
+        f" · P10 {log_to_simple_pct(c['p10']):+.1f}%"
+        f" · P50 {log_to_simple_pct(c['p50']):+.1f}%"
+        f" · 仓位 {c['size']:.2%}"
+        for c in candidates[:15]
+    ]
     title = f"📋 候选池 {date} · {len(candidates)} 个"
     body = "\n".join(lines) or "今日无候选"
     if fails:

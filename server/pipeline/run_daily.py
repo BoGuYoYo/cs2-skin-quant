@@ -57,19 +57,6 @@ def load_watchlist(con) -> list[str]:
     return collector.load_watchlist(con)
 
 
-def make_kline(hist: pd.DataFrame) -> pd.DataFrame:
-    """日线聚合：一天多个采样点时取 first/max/min/last，单点时 open=前一日 close"""
-    if hist.empty:
-        return hist
-    g = hist.groupby(["item_id", "date"])["price"]
-    agg = g.agg(o="first", h="max", l="min", c="last").reset_index()
-    agg["v"] = hist.groupby(["item_id", "date"])["volume"].sum().to_numpy()
-    agg = agg.sort_values(["item_id", "date"])
-    prev_close = agg.groupby("item_id")["c"].shift(1)
-    agg["o"] = prev_close.fillna(agg["o"])
-    return agg
-
-
 def load_or_train(cfg: Cfg, labeled: pd.DataFrame) -> tuple[QuantileModel, CQR, dict[str, Any]]:
     """按 retrain_days 决定是否重训；同时产出 CQR 校准器"""
     meta: dict[str, Any] = {}
@@ -261,14 +248,20 @@ def _push_cold_start(con, cfg: Cfg, day: str, now_ts: int, labeled, reason: str)
     try:
         # 注意：这里**不再**生成/推送 kline。
         # 采集阶段（collector.collect_daily_kline）已经把 K 线原始 OHLC 写进 kline 表了；
-        # 而 make_kline 是从 snap 的单点价格反推 o=h=l=c 的假 OHLC，
-        # 推上去会用假数据覆盖真数据（踩过）。
+        # 而曾经那个 make_kline（已删）只能从 snap 的单点价格反推 o=h=l=c 的假 OHLC，
+        # 推上去会把真数据覆盖成假的（踩过，所以那个函数连同它的用法一起删掉了）。
+        #
+        # ⚠️ 关联条件用 item_id，不是 market_hash_name。
+        # 原先写的是 `WHERE market_hash_name IN (SELECT DISTINCT item_id FROM snap)` ——
+        # 拿「哈希名列」去比「id 列」。它当时能跑通，纯粹因为 write_items 把
+        # item_id 设成了 market_hash_name（当前的不变量），不是结构上成立。
+        # 属于紧挨着的注释警告的那类「靠巧合」的写法，已改成同列比较。
         item_rows = [
             {"item_id": r[0], "name": r[1], "market_hash_name": r[2], "wear": r[3],
              "case_id": r[4], "case_name": r[5], "image": r[6], "updated_at": now_ts}
             for r in con.execute(
                 "SELECT item_id, name, market_hash_name, wear, case_id, case_name, image FROM items "
-                "WHERE market_hash_name IN (SELECT DISTINCT item_id FROM snap)"
+                "WHERE item_id IN (SELECT DISTINCT item_id FROM snap)"
             ).fetchall()
         ]
 
@@ -544,7 +537,8 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
 
     # ---------------- 6. 推送 ----------------
     # 不推 kline：采集阶段已把原始 OHLC 写进 kline 表，
-    # 而 make_kline 只能从 snap 单点反推 o=h=l=c，推上去会用假 OHLC 覆盖真数据（踩过）。
+    # 而从 snap 单点反推的 o=h=l=c 是假 OHLC，推上去会用假数据覆盖真数据
+    # （踩过；当初那个 make_kline 函数连它一起删了，免得有人再去调）。
     item_rows = [
         {"item_id": r[0], "name": r[1], "market_hash_name": r[2], "wear": r[3],
          "case_id": r[4], "case_name": r[5], "image": r[6], "updated_at": now_ts}
@@ -676,7 +670,10 @@ def _print_top(candidates: list[dict[str, Any]]) -> None:
         log.info(
             "  %-42s ¥%7.2f  P10 %+6.1f%%  P50 %+6.1f%%  仓位 %.2f%%  打分 %.1f",
             (c["name"] or c["item_id"])[:42], c["price"],
-            np.expm1(c["p10"]) * 100, np.expm1(c["p50"]) * 100, c["size"] * 100, c["score"],
+            # 对数 → 简单收益换算统一走 notify.log_to_simple_pct，
+            # 别再各自写 np.expm1（手机通知那条通道就是这么写错的）
+            notify.log_to_simple_pct(c["p10"]), notify.log_to_simple_pct(c["p50"]),
+            c["size"] * 100, c["score"],
         )
 
 

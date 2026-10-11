@@ -153,7 +153,14 @@ def health() -> dict[str, Any]:
 def meta() -> dict[str, Any]:
     con = db()
     try:
-        meta_rows = con.execute("SELECT k, v FROM meta").fetchall()
+        # meta 表可能还没建（只有采集器碰过的新库）。这不是错误状态 ——
+        # 前端要的是 latestForecastDate 和 counts，不该因为一张键值表就 500。
+        # （踩过：裸查 meta 时，同类库上这个接口直接 500，Dashboard 拿不到基准日）
+        try:
+            meta_rows = con.execute("SELECT k, v FROM meta").fetchall()
+        except sqlite3.Error as e:
+            log.warning("meta 表不可读（%s），本次按空处理", e)
+            meta_rows = []
         day = _latest_date(con, "forecast")
         counts = {
             "items": con.execute("SELECT COUNT(*) AS n FROM items").fetchone()["n"],
