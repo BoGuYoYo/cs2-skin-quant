@@ -388,10 +388,11 @@ def test_weapon_exclusion_sql() -> None:
         'NOT LIKE Negev%'（不带 " | "）则会漏掉 'Souvenir Negev | ...' 这种带前缀的形态。
     两种错都很隐蔽 —— 前者悄悄少赚，后者悄悄没生效。
     """
-    print("\n[14] 枪械排除：内格夫 / M249 / 贝瑞塔 / CZ / SG553")
-    check("五把枪都在配置里",
+    print("\n[14] 枪械排除：内格夫 / M249 / 贝瑞塔 / CZ / SG553 / SCAR-20 / G3SG1 / PP-Bizon")
+    check("八把枪都在配置里",
           set(DOMAIN_EXCLUDE_WEAPONS) == {"Negev", "M249", "Dual Berettas",
-                                          "CZ75-Auto", "SG 553"},
+                                          "CZ75-Auto", "SG 553",
+                                          "SCAR-20", "G3SG1", "PP-Bizon"},
           f"{DOMAIN_EXCLUDE_WEAPONS}")
     check("匹配带上 ' | ' 分隔符（不用裸子串）", "Negev | %" in DOMAIN_EXCLUDE_SQL)
 
@@ -406,10 +407,14 @@ def test_weapon_exclusion_sql() -> None:
         ("Dual Berettas | Melondrama (Factory New)", False),
         ("CZ75-Auto | Tacticat (Well-Worn)", False),
         ("SG 553 | Cyrex (Field-Tested)", False),
+        ("SCAR-20 | Bloodsport (Factory New)", False),
+        ("G3SG1 | The Executioner (Minimal Wear)", False),
+        ("PP-Bizon | Judgement of Anubis (Field-Tested)", False),
         # 带前缀形态：即使哪天放开纪念品/StatTrak 也仍然要挡住
         ("Souvenir Negev | Man-o'-war (Field-Tested)", False),
         ("StatTrak™ M249 | Aztec (Minimal Wear)", False),
         ("Genuine CZ75-Auto | X", False),
+        ("Souvenir G3SG1 | X", False),
         # 必须保留：同类名字最容易被误伤
         ("M4A4 | 龙王 (Factory New)", True),
         ("M4A1-S | Printstream (Field-Tested)", True),
@@ -418,6 +423,8 @@ def test_weapon_exclusion_sql() -> None:
         ("SSG 08 | Fever Dream (Minimal Wear)", True),
         ("Galil AR | Chatterbox (Well-Worn)", True),
         ("MAC-10 | Neon Rider (Factory New)", True),
+        ("P250 | X (Factory New)", True),
+        ("P90 | X (Factory New)", True),
     ]
     for i, (mhn, _) in enumerate(samples):
         con.execute("INSERT INTO items VALUES (?,?,?)", (mhn, mhn.split(" | ")[0], mhn))
@@ -425,8 +432,8 @@ def test_weapon_exclusion_sql() -> None:
 
     missed = [m for m, keep in samples if not keep and m in kept]
     killed = [m for m, keep in samples if keep and m not in kept]
-    check("五把枪（含带前缀形态）全部被排除", not missed, f"漏掉：{missed}")
-    check("没有误伤 M4A4 / M4A1-S / AK-47 / AWP / SSG 08 / Galil / MAC-10",
+    check("八把枪（含带前缀形态）全部被排除", not missed, f"漏掉：{missed}")
+    check("没有误伤 M4A4 / M4A1-S / AK-47 / AWP / SSG 08 / Galil / MAC-10 / P250 / P90",
           not killed, f"误杀：{killed}")
 
 

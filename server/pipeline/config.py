@@ -161,12 +161,16 @@ CFG = Cfg()
 #:   1) 纪念品不看
 #:   2) StatTrak 不看
 #:   3) 内格夫、M249、贝瑞塔、CZ、SG553「等枪械」不看
+#:   4) 追加点名：SCAR-20、G3SG1、PP-Bizon
 DOMAIN_EXCLUDE_WEAPONS: tuple[str, ...] = (
     "Negev",          # 内格夫（机枪，盘口最薄）
     "M249",           # M249（机枪）
     "Dual Berettas",  # 双持贝瑞塔
     "CZ75-Auto",      # CZ75 自动型（简称 CZ）
     "SG 553",         # SG553
+    "SCAR-20",        # 连狙
+    "G3SG1",          # 连狙
+    "PP-Bizon",       # PP-野牛（冲锋枪，冷门）
 )
 # 想再砍几把枪就往上面这个元组里加名字即可 —— 采集池 / 推理截面 /
 # 前端列表接口三处都会自动跟着变（见文件末尾 DOMAIN_EXCLUDE_SQL 的拼装）。
