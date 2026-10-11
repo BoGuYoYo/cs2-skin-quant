@@ -19,6 +19,7 @@ state/
 .env
 .env.local
 *.key
+.ingest-token
 
 # 构建与工具
 .wrangler/

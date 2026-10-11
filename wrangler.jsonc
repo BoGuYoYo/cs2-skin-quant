@@ -13,14 +13,14 @@
     {
       "binding": "DB",
       "database_name": "skin_alpha",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "database_id": "e939c873-0801-40c1-a06c-4acefbfdd0e6",
       "migrations_dir": "migrations"
     }
   ],
   "kv_namespaces": [
     {
       "binding": "CACHE",
-      "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+      "id": "34f7f52cf81743a58e68affe59c1792b"
     }
   ],
   "triggers": {
