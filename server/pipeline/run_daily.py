@@ -50,13 +50,8 @@ def today_str() -> str:
 
 
 def load_watchlist(con) -> list[str]:
-    """监控池 = items 表里的全部 market_hash_name。
-
-    建议不要无脑全量：几百到几千个足够。品种太多会让每次采集变慢、
-    也会稀释模型的注意力（长尾品种本身流动性差、噪声大）。
-    """
-    cur = con.execute("SELECT market_hash_name FROM items WHERE market_hash_name IS NOT NULL")
-    return [r[0] for r in cur.fetchall()]
+    """监控池 —— 定义已统一到 collector.WATCHLIST_SQL，避免两处规则漂移"""
+    return collector.load_watchlist(con)
 
 
 def make_kline(hist: pd.DataFrame) -> pd.DataFrame:
@@ -129,6 +124,53 @@ def _split_tail(df: pd.DataFrame, frac: float) -> tuple[pd.DataFrame, pd.DataFra
     return d.iloc[:cut], d.iloc[cut:]
 
 
+def _push_cold_start(con, cfg: Cfg, day: str, now_ts: int, hist, reason: str) -> None:
+    """冷启动期（标签未成熟）只推送基础数据。
+
+    没有 forecast / factor_latest —— 前端会显示「今日打分标的 0」，
+    但 K 线、饰品列表、运行日志都是真实的。总比线上空空如也强，
+    也让你能提前验证采集链路是否稳定。
+    """
+    try:
+        kline_df = make_kline(hist)
+        kline_rows = [
+            {"item_id": r.item_id, "date": r.date.strftime("%Y-%m-%d"),
+             "o": float(r.o), "h": float(r.h), "l": float(r.l), "c": float(r.c),
+             "v": int(r.v) if pd.notna(r.v) else None}
+            for r in kline_df.itertuples()
+        ] if not kline_df.empty else []
+
+        item_rows = [
+            {"item_id": r[0], "name": r[1], "market_hash_name": r[2], "wear": r[3],
+             "case_id": r[4], "case_name": r[5], "image": r[6], "updated_at": now_ts}
+            for r in con.execute(
+                "SELECT item_id, name, market_hash_name, wear, case_id, case_name, image FROM items "
+                "WHERE market_hash_name IN (SELECT DISTINCT item_id FROM snap)"
+            ).fetchall()
+        ]
+
+        plan = [
+            ("items", item_rows, {}),
+            ("kline", kline_rows, {}),
+            ("meta", [
+                {"k": "model_version", "v": f"{cfg.model_version}-coldstart", "updated_at": now_ts},
+                {"k": "last_run", "v": day, "updated_at": now_ts},
+                {"k": "status", "v": "cold_start", "updated_at": now_ts},
+                {"k": "cold_start_reason", "v": reason[:200], "updated_at": now_ts},
+                {"k": "snap_rows", "v": str(len(hist)), "updated_at": now_ts},
+            ], {}),
+            ("runs", [
+                {"ts": now_ts, "stage": "daily-coldstart", "ok": 1, "rows": len(kline_rows),
+                 "message": f"冷启动采集 {len(hist)} 行快照；预测已跳过"},
+            ], {}),
+        ]
+        for stage, rows, kw in plan:
+            dispatch.push(stage, rows, **kw)
+        log.info("冷启动基础数据已推送：items %d / kline %d", len(item_rows), len(kline_rows))
+    except Exception as e:
+        log.error("冷启动推送失败：%s", e)
+
+
 # ------------------------------------------------------------------ 主流程
 def run(dry_run: bool = False, backtest_only: bool = False) -> int:
     cfg = CFG
@@ -141,6 +183,7 @@ def run(dry_run: bool = False, backtest_only: bool = False) -> int:
     con = collector.connect(cfg.db_path)
     session = requests.Session()
     day = today_str()
+    now_ts = int(time.time())      # 提前定义：训练失败走冷启动分支时也要用到
     fails: list[str] = []
 
     # ---------------- 1. 采集 ----------------
@@ -156,9 +199,19 @@ def run(dry_run: bool = False, backtest_only: bool = False) -> int:
             log.error("base 同步失败：%s", e)
             return 3
 
-    log.info("监控池 %d 个品种", len(watchlist))
+    log.info("监控池 %d 个武器皮肤（已排除印花/涂鸦/挂件等）", len(watchlist))
+
+    # 采集规模：SteamDT 的 /price/batch 限流 1 次/分钟 × 100 个品种。
+    #   2000 个   → 20 次请求  → 约 20 分钟
+    #   18826 个  → 189 次请求 → 约 3.2 小时
+    #   44497 全量 → 445 次请求 → 约 7.5 小时
+    # WATCH_LIMIT=0 表示不限量（全池）。
+    limit = int(os.environ.get("WATCH_LIMIT", "2000"))
+    pool = watchlist if limit <= 0 else watchlist[:limit]
+    log.info("本轮采集 %d 个（WATCH_LIMIT=%s，预计 %.0f 分钟）",
+             len(pool), "不限" if limit <= 0 else limit, len(pool) / 100 * 61 / 60)
     try:
-        blocks = collector.fetch_prices(watchlist[:200], key, session)  # 先跑 200 个，确认流程
+        blocks = collector.fetch_prices(pool, key, session)
         n = collector.write_daily_snapshot(con, blocks, day)
         log.info("写入当日快照 %d 行", n)
     except Exception as e:
@@ -196,6 +249,9 @@ def run(dry_run: bool = False, backtest_only: bool = False) -> int:
     except RuntimeError as e:
         log.error("%s", e)
         fails.append(str(e))
+        if not dry_run:
+            log.warning("冷启动期：跳过预测，但仍推送已采集的基础数据（items / kline）")
+            _push_cold_start(con, cfg, day, now_ts, hist, str(e))
         return 5
 
     # ---------------- 5. 推理 ----------------

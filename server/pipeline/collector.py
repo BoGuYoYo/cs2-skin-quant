@@ -162,6 +162,41 @@ def _wear(market_hash_name: str) -> str | None:
     return None
 
 
+# 监控池定义：只保留可交易的武器皮肤与探员。
+#
+# 踩过的坑：/base 返回 44497 个品种，但其中大量是**不可交易**的道具 ——
+# 服役勋章、大行动之星、生日硬币、音乐盒胶囊、涂鸦、挂件、印花。
+# 它们拿 K 线只会返回空数据（曾经让回填成功率看起来只有 20%，其实是规则没滤干净）。
+# 另外千万**不要**排除「探员」—— Agent 是可交易饰品，价格数据完整。
+WATCHLIST_SQL = """
+  SELECT market_hash_name FROM items
+   WHERE market_hash_name IS NOT NULL
+     AND market_hash_name NOT LIKE '#%'
+     AND name NOT LIKE '%印花%'
+     AND name NOT LIKE '%涂鸦%'
+     AND name NOT LIKE '%挂件%'
+     AND name NOT LIKE '%音乐盒%'
+     AND name NOT LIKE '%硬币%'
+     AND name NOT LIKE '%勋章%'
+     AND name NOT LIKE '%大行动之星%'
+     AND name NOT LIKE '%胶囊%'
+     AND name NOT LIKE '%通行证%'
+     AND market_hash_name NOT LIKE '%Coin%'
+     AND market_hash_name NOT LIKE '%Medal%'
+     AND market_hash_name NOT LIKE '%Star for Operation%'
+     AND market_hash_name NOT LIKE '%Music Kit%'
+     AND market_hash_name NOT LIKE '%Capsule%'
+     AND market_hash_name NOT LIKE '%Graffiti%'
+     AND market_hash_name NOT LIKE '%Patch%'
+   ORDER BY market_hash_name
+"""
+
+
+def load_watchlist(con: sqlite3.Connection) -> list[str]:
+    """监控池 = 可交易的武器皮肤 + 探员（排除不可交易道具）"""
+    return [r[0] for r in con.execute(WATCHLIST_SQL).fetchall()]
+
+
 def load_history(con: sqlite3.Connection, days: int = 1200) -> pd.DataFrame:
     """读取本地快照仓 → 宽表 DataFrame"""
     df = pd.read_sql_query(
