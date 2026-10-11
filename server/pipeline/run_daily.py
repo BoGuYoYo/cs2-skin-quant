@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -33,7 +34,7 @@ from .config import CFG, FEATURE_COLS, Cfg
 from .model import QuantileModel, acceptance, walk_forward
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from push import notify, to_cloudflare  # noqa: E402
+from push import dispatch, notify  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -323,23 +324,37 @@ def run(dry_run: bool = False, backtest_only: bool = False) -> int:
         for c in cases_mod.load_cases(con)
     ]
 
+    log.info("推送通道：%s", dispatch.describe())
     try:
-        to_cloudflare.push("items", item_rows)
-        to_cloudflare.push("case_meta", case_rows)
-        to_cloudflare.push("factor_latest", factor_rows)
-        to_cloudflare.push("forecast", forecast_rows, replace_date=day)
-        to_cloudflare.push("alerts", alert_rows)
-        to_cloudflare.push("kline", kline_rows)
-        to_cloudflare.push("meta", [
-            {"k": "model_version", "v": cfg.model_version, "updated_at": now_ts},
-            {"k": "last_run", "v": day, "updated_at": now_ts},
-            {"k": "horizon", "v": str(cfg.horizon), "updated_at": now_ts},
-            {"k": "cqr_Q", "v": str(calib_meta.get("cqr_Q")), "updated_at": now_ts},
-        ])
-        to_cloudflare.push("runs", [
-            {"ts": now_ts, "stage": "daily", "ok": 1, "rows": len(forecast_rows),
-             "message": f"候选 {len(candidates)}，异动 {len(alert_rows)}"},
-        ])
+        for stage, rows, kw in [
+            ("items", item_rows, {}),
+            ("case_meta", case_rows, {}),
+            ("factor_latest", factor_rows, {}),
+            ("forecast", forecast_rows, {"replace_date": day}),
+            ("alerts", alert_rows, {}),
+            ("kline", kline_rows, {}),
+            (
+                "meta",
+                [
+                    {"k": "model_version", "v": cfg.model_version, "updated_at": now_ts},
+                    {"k": "last_run", "v": day, "updated_at": now_ts},
+                    {"k": "horizon", "v": str(cfg.horizon), "updated_at": now_ts},
+                    {"k": "cqr_Q", "v": str(calib_meta.get("cqr_Q")), "updated_at": now_ts},
+                ],
+                {},
+            ),
+            (
+                "runs",
+                [
+                    {
+                        "ts": now_ts, "stage": "daily", "ok": 1, "rows": len(forecast_rows),
+                        "message": f"候选 {len(candidates)}，异动 {len(alert_rows)}",
+                    }
+                ],
+                {},
+            ),
+        ]:
+            dispatch.push(stage, rows, **kw)
     except Exception as e:
         fails.append(f"推送失败: {e}")
         log.error("推送失败：%s", e)
@@ -410,7 +425,19 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="skin-alpha 每日管线")
     ap.add_argument("--dry-run", action="store_true", help="只计算不推送")
     ap.add_argument("--backtest", action="store_true", help="只做 walk-forward 评估并打印验收结论")
+    ap.add_argument("--check-push", action="store_true", help="只测推送通道连通性（不采集不训练）")
     args = ap.parse_args()
+
+    if args.check_push:
+        result = dispatch.check()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        ok = all(
+            v.get("ok", False)
+            for k, v in result.items()
+            if k in ("worker", "d1") and isinstance(v, dict)
+        )
+        return 0 if ok else 1
+
     return run(dry_run=args.dry_run, backtest_only=args.backtest)
 
 

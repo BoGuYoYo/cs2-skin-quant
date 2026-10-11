@@ -12,9 +12,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from datetime import date, timedelta
+from pathlib import Path
 
 import numpy as np
 import requests
@@ -210,30 +212,48 @@ def math_log(a: float, b: float) -> float:
     return float(np.log(max(a, 1e-9) / max(b, 1e-9)))
 
 
-def push(url: str, token: str, stage: str, rows: list, chunk: int = 500, replace_date: str | None = None) -> int:
-    total = 0
-    for i in range(0, len(rows), chunk):
-        body = {"stage": stage, "rows": rows[i:i + chunk]}
-        if i == 0 and replace_date:
-            body["replaceDate"] = replace_date
-        r = requests.post(f"{url.rstrip('/')}/api/ingest", json=body,
-                          headers={"authorization": f"Bearer {token}"}, timeout=60)
-        if r.status_code == 401:
-            print(f"  ✗ {stage}: 401 未授权（检查 --token 与 .dev.vars 的 INGEST_TOKEN）")
-            return total
-        data = r.json()
-        if not r.ok or not data.get("ok"):
-            print(f"  ✗ {stage}: {data.get('error')}")
-            return total
-        total += int(data["data"].get("inserted", 0))
-    print(f"  ✓ {stage:<14} {total:>6} 行")
-    return total
+SERVER_DIR = Path(__file__).resolve().parent.parent / "server"
+_dispatch = None
+
+
+def _get_dispatch(mode: str, url: str, token: str):
+    """延迟导入 push.dispatch —— 它是在 import 时读 PUSH_MODE 的，必须先设好环境变量"""
+    global _dispatch
+    if _dispatch is None:
+        os.environ["PUSH_MODE"] = mode
+        if url:
+            os.environ.setdefault("CF_PUSH_URL", url)
+        if token:
+            os.environ.setdefault("INGEST_TOKEN", token)
+        if str(SERVER_DIR) not in sys.path:
+            sys.path.insert(0, str(SERVER_DIR))
+        from push import dispatch as _d
+        _dispatch = _d
+        print(f"  推送通道：{_d.describe()}")
+    return _dispatch
+
+
+def push_stage(stage: str, rows: list, replace_date: str | None = None) -> int:
+    if not rows:
+        print(f"  - {stage:<14} {'(空)':>6}")
+        return 0
+    try:
+        n = _dispatch.push(stage, rows, replace_date=replace_date)
+        print(f"  ✓ {stage:<14} {n:>6} 行")
+        return n
+    except Exception as e:
+        print(f"  ✗ {stage:<14} {e}")
+        return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default="http://127.0.0.1:8787")
-    ap.add_argument("--token", default="dev-token-local")
+    ap.add_argument("--mode", default="worker", choices=["worker", "d1", "both"],
+                    help="worker=走自己的 Worker；d1=直连 Cloudflare D1 REST API")
+    ap.add_argument("--url", default="http://127.0.0.1:8787",
+                    help="Worker 地址（--mode worker 时用）")
+    ap.add_argument("--token", default="dev-token-local",
+                    help="Worker 的 INGEST_TOKEN（--mode worker 时用）")
     ap.add_argument("--date", default=date.today().isoformat())
     args = ap.parse_args()
 
@@ -243,19 +263,29 @@ def main() -> int:
     print(f"\n生成演示数据（{len(SPECS)} 个饰品 × {DAYS} 天）…")
     payloads = build_payloads(today, rng)
 
-    print(f"推送到 {args.url}")
-    total = 0
-    total += push(args.url, args.token, "items", payloads["items"])
-    total += push(args.url, args.token, "case_meta", payloads["case_meta"])
-    total += push(args.url, args.token, "factor_latest", payloads["factor_latest"])
-    total += push(args.url, args.token, "forecast", payloads["forecast"], replace_date=today.isoformat())
-    total += push(args.url, args.token, "market_index", payloads["market_index"], replace_date=today.isoformat())
-    total += push(args.url, args.token, "backtest", payloads["backtest"])
-    total += push(args.url, args.token, "kline", payloads["kline"])
-    total += push(args.url, args.token, "alerts", payloads["alerts"])
-    total += push(args.url, args.token, "meta", payloads["meta"])
+    _get_dispatch(args.mode, args.url, args.token)
+    target = "Cloudflare D1" if args.mode in ("d1", "both") else args.url
+    print(f"目标：{target}")
 
-    print(f"\n完成，共写入 {total} 行。打开 {args.url} 查看。\n")
+    total = 0
+    for stage, key, rd in [
+        ("items", "items", None),
+        ("case_meta", "case_meta", None),
+        ("factor_latest", "factor_latest", None),
+        ("forecast", "forecast", today.isoformat()),
+        ("market_index", "market_index", None),
+        ("backtest", "backtest", None),
+        ("kline", "kline", None),
+        ("alerts", "alerts", None),
+        ("meta", "meta", None),
+    ]:
+        total += push_stage(stage, payloads[key], rd)
+
+    print(f"\n完成，共写入 {total} 行。")
+    if args.mode in ("d1", "both"):
+        print("数据已在线上 D1 —— 等域名 zone 变成 active 就能打开网页看到。\n")
+    else:
+        print(f"打开 {args.url} 查看。\n")
     return 0
 
 
