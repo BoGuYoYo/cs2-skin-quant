@@ -85,6 +85,17 @@ const STAGES: Record<string, Stage> = {
 
 const BATCH_MAX = 900; // 免费档 1000，留出余量
 
+/**
+ * 允许「整表替换」的 stage（先清空再插入）。
+ *
+ * 只有语义上就是「当前快照」的表才配得上：
+ *   factor_latest —— 当前截面。云端此前只做逐行 upsert，被流动性闸门/新鲜度闸门
+ *   剔除的品种那一行会永远留着，而 /screener 又不带日期条件 —— 旧行会被当成
+ *   当前扫描结果一直展示（本地已经修掉，云端副本漏了）。
+ * 白名单而不是随便什么表都能清：一个误传的布尔值不该能把历史表抹掉。
+ */
+const REPLACE_ALL_STAGES = new Set(['factor_latest']);
+
 function insertSql(stage: Stage): string {
   const ph = stage.cols.map(() => '?').join(',');
   return `INSERT OR REPLACE INTO ${stage.table} (${stage.cols.join(',')}) VALUES (${ph})`;
@@ -103,7 +114,14 @@ function rowToBind(row: Record<string, unknown>, stage: Stage): unknown[] {
 ingestRoutes.post('/ingest', async (c) => {
   if (!isIngestAuthorized(c.req.raw, c.env)) return fail('unauthorized', 401);
 
-  let body: { stage?: string; rows?: unknown[]; replaceDate?: string; replaceSeries?: string };
+  let body: {
+    stage?: string;
+    rows?: unknown[];
+    replaceDate?: string;
+    replaceSeries?: string;
+    replaceSince?: number;
+    replaceAll?: boolean;
+  };
   try {
     body = await c.req.json();
   } catch {
@@ -120,6 +138,15 @@ ingestRoutes.post('/ingest', async (c) => {
   const db = c.env.DB;
   let deleted = 0;
 
+  // 整表替换：用于「当前截面」这类表（见 REPLACE_ALL_STAGES 的说明）
+  if (body.replaceAll === true) {
+    if (!REPLACE_ALL_STAGES.has(stageName)) {
+      return fail(`stage ${stageName} 不支持 replaceAll`, 400);
+    }
+    const del = await db.prepare(`DELETE FROM ${stage.table}`).run();
+    deleted = del.meta.changes ?? 0;
+  }
+
   // 幂等重跑：先删掉同日/同序列旧数据
   if (body.replaceDate && stage.cols.includes('date')) {
     const del = await db.prepare(`DELETE FROM ${stage.table} WHERE date = ?`).bind(body.replaceDate).run();
@@ -127,6 +154,16 @@ ingestRoutes.post('/ingest', async (c) => {
   }
   if (body.replaceSeries && stage.cols.includes('item_id')) {
     const del = await db.prepare(`DELETE FROM ${stage.table} WHERE item_id = ?`).bind(body.replaceSeries).run();
+    deleted += del.meta.changes ?? 0;
+  }
+  // 只有 ts、没有 date 的表（alerts）：按时间戳划界替换。
+  // 踩过的坑：alerts 的 pk 是 [] + INSERT OR REPLACE，没有冲突键就退化成普通插入，
+  // 而 replaceDate 又只对含 date 的表生效 —— 一天跑两次云端告警就翻倍。
+  if (typeof body.replaceSince === 'number' && stage.cols.includes('ts')) {
+    const del = await db
+      .prepare(`DELETE FROM ${stage.table} WHERE ts >= ?`)
+      .bind(body.replaceSince)
+      .run();
     deleted += del.meta.changes ?? 0;
   }
 

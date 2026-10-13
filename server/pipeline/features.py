@@ -7,10 +7,14 @@
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 
 from .config import FEATURE_COLS
+
+log = logging.getLogger("features")
 
 
 def drop_duration(price: pd.Series, win: int = 30) -> pd.Series:
@@ -63,10 +67,14 @@ def build(
     case_df: pd.DataFrame | None = None,
     index_df: pd.DataFrame | None = None,
     events_df: pd.DataFrame | None = None,
+    case_hist: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     hist:     item_id, date, price, bid, listings, volume, supply
     case_df:  case_id, case_name, rarity_score, case_volume_30d, supply_growth_30d, drop_pool
+              （**当前**的箱子快照）
+    case_hist: case_id, date, rarity_score（**逐日**复算的稀有度，见
+              cases_build.build_history）—— 回测防前视泄漏靠它，缺省时退回 case_df
     index_df: date, index_value
     events_df: date, direction, affected_cases, confidence（LLM 事件表）
     返回：原始列 + FEATURE_COLS
@@ -117,6 +125,22 @@ def build(
         if col not in df.columns:
             df[col] = default
     df["case_rarity_score"] = df["rarity_score"].fillna(50.0)
+
+    # --------------------------------------------- 逐日稀有度（防前视泄漏）
+    # case_meta 里的 rarity_score 是用**今天**的箱价/趋势/中位价算的；
+    # 把它 merge 到全部历史日期上，等于让历史样本提前知道"这个箱子后来变稀有了"
+    # —— 而箱价本身编码了这一年的涨跌。walk-forward 的 purge/embargo 拦不住
+    # "静态特征里带未来"，所以按日复算的历史值必须优先（审查发现）。
+    # 历史表没覆盖到的日期（新箱上线前、或还没构建历史）退回静态值。
+    if case_hist is not None and not case_hist.empty and "case_id" in df.columns:
+        ch = case_hist[["case_id", "date", "rarity_score"]].copy()
+        ch["date"] = pd.to_datetime(ch["date"])
+        ch = ch.rename(columns={"rarity_score": "rarity_score_byday"})
+        df = df.merge(ch, on=["case_id", "date"], how="left")
+        n_hit = int(df["rarity_score_byday"].notna().sum())
+        df["case_rarity_score"] = df["rarity_score_byday"].fillna(df["case_rarity_score"])
+        df = df.drop(columns=["rarity_score_byday"])
+        log.debug("逐日稀有度命中 %d 行", n_hit)
 
     # 供给刚性合成：箱子稀有（高）+ 存世量增速低 → 供给接近饱和
     #

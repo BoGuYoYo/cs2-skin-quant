@@ -59,13 +59,32 @@ def describe() -> str:
     }[MODE]
 
 
+class PartialPushError(RuntimeError):
+    """部分通道成功、部分失败。
+
+    为什么要单独一个异常（审查发现）：原先只要有一条通道成功就当成成功 ——
+    both 模式下本地写完、云端挂了，只留一行 warning，run_daily 完全不知道，
+    候选池就成了「本地看着正常、云端残缺」的静默不一致。
+    现在把它区分出来：调用方可以据此把这次运行标成降级（但不必整轮失败）。
+    """
+
+
 def push(
     stage: str,
     rows: Sequence[dict[str, Any]] | Any,
     *,
     replace_date: str | None = None,
     replace_series: str | None = None,
+    replace_since_ts: int | None = None,
+    replace_all: bool = False,
 ) -> int:
+    """推送一个 stage；replace_since_ts 用于 alerts 这种「只有 ts、没有 date」的表。
+
+    审查发现：alerts 在云端会同日重复 —— 本地那句「推送前先清掉当天旧记录」
+    删的是本地库，而 Worker 侧 alerts 没有主键、replaceDate 又只对含 date 的
+    表生效，于是一天跑两次（07:00 + 19:00）云端告警就翻倍。
+    所以补一个按时间戳划界的替换语义。
+    """
     if MODE == "none":
         log.info("stage=%s 跳过（PUSH_MODE=none）", stage)
         return 0
@@ -77,7 +96,10 @@ def push(
     # 本地优先：它是前端的第一数据源，失败必须暴露出来
     if MODE in ("local", "both"):
         try:
-            total += _local().push(stage, rows, replace_date=replace_date, replace_series=replace_series)
+            total += _local().push(stage, rows, replace_date=replace_date,
+                                   replace_series=replace_series,
+                                   replace_since_ts=replace_since_ts,
+                                   replace_all=replace_all)
         except Exception as e:
             errors.append(f"local: {e}")
             log.warning("本地通道失败（stage=%s）：%s", stage, e)
@@ -87,7 +109,10 @@ def push(
     # worker 每次超时 60 秒拖慢整条管线）
     if MODE == "worker":
         try:
-            total += _worker().push(stage, rows, replace_date=replace_date, replace_series=replace_series)
+            total += _worker().push(stage, rows, replace_date=replace_date,
+                                    replace_series=replace_series,
+                                    replace_since_ts=replace_since_ts,
+                                    replace_all=replace_all)
         except Exception as e:
             errors.append(f"worker: {e}")
             log.warning("Worker 通道失败（stage=%s）：%s", stage, e)
@@ -97,14 +122,20 @@ def push(
             log.info("stage=%s 跳过 D1（大表，免费额度 10 万行/天，见 D1_SKIP_STAGES）", stage)
         else:
             try:
-                total += _d1().push(stage, rows, replace_date=replace_date, replace_series=replace_series)
+                total += _d1().push(stage, rows, replace_date=replace_date,
+                                    replace_series=replace_series,
+                                    replace_since_ts=replace_since_ts,
+                                    replace_all=replace_all)
             except Exception as e:
                 errors.append(f"d1: {e}")
                 log.warning("D1 通道失败（stage=%s）：%s", stage, e)
 
-    # 只要有一条通道成功就算成功（both 模式下 Cloudflare 挂了不该让管线失败）
+    # 一条通道都没成功 = 整轮失败；部分成功 = 降级（要让调用方看得见）
     if errors and total == 0:
         raise RuntimeError("; ".join(errors))
+    if errors:
+        log.error("stage=%s 部分通道失败（已写入 %d 行）：%s", stage, total, "; ".join(errors))
+        raise PartialPushError("; ".join(errors))
     return total
 
 

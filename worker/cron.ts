@@ -11,6 +11,7 @@ import type { Env } from './index';
 
 const KLINE_RETAIN_DAYS = 800;
 const ALERT_RETAIN_DAYS = 180;
+const RUN_RETAIN_DAYS = 30;
 
 async function runDaily(env: Env, cron: string): Promise<void> {
   const started = Date.now();
@@ -24,6 +25,12 @@ async function runDaily(env: Env, cron: string): Promise<void> {
     const cutoffAlert = Math.floor((Date.now() - ALERT_RETAIN_DAYS * 86400_000) / 1000);
     const d2 = await env.DB.prepare('DELETE FROM alerts WHERE ts < ?').bind(cutoffAlert).run();
     notes.push(`alerts_pruned=${d2.meta.changes ?? 0}`);
+
+    // runs 是纯日志表：每个 ingest 都写一行、cron 自己也写一行，只增不减
+    // （审查发现）。不清的话 D1 存储会一直被日志吃掉。
+    const cutoffRun = Date.now() - RUN_RETAIN_DAYS * 86400_000;
+    const d3 = await env.DB.prepare('DELETE FROM runs WHERE ts < ?').bind(cutoffRun).run();
+    notes.push(`runs_pruned=${d3.meta.changes ?? 0}`);
   } catch (e) {
     notes.push(`prune_failed=${(e as Error).message}`);
   }

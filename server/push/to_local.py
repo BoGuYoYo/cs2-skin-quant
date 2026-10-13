@@ -187,6 +187,8 @@ def push(
     *,
     replace_date: str | None = None,
     replace_series: str | None = None,
+    replace_since_ts: int | None = None,
+    replace_all: bool = False,
 ) -> int:
     """写本地 SQLite（接口与 to_d1.push 完全一致）"""
     cols = STAGES.get(stage)
@@ -215,11 +217,23 @@ def push(
     con = connect()
     try:
         changed = 0
+        if replace_all:
+            # 整表替换（factor_latest 这种「当前截面」表）：
+            # 不这么做的话，本轮没入选的品种会留着上一轮的行，而 /api/screener
+            # 不看日期 —— 旧行会被当成当前扫描结果一直展示。
+            cur = con.execute(f"DELETE FROM {stage}")
+            changed += cur.rowcount or 0
         if replace_date and "date" in cols:
             cur = con.execute(f"DELETE FROM {stage} WHERE date = ?", (replace_date,))
             changed += cur.rowcount or 0
         if replace_series and "item_id" in cols:
             cur = con.execute(f"DELETE FROM {stage} WHERE item_id = ?", (replace_series,))
+            changed += cur.rowcount or 0
+        # alerts 这类只有 ts、没有 date 的表：按时间戳划界替换，
+        # 否则同日第二次运行会把同样的告警再插一遍（本地靠 run_daily 那句
+        # 「清理今日旧告警」删，云端没有等价物 —— 见 dispatch.PartialPushError 的注释）
+        if replace_since_ts is not None and "ts" in cols:
+            cur = con.execute(f"DELETE FROM {stage} WHERE ts >= ?", (replace_since_ts,))
             changed += cur.rowcount or 0
 
         ph = ",".join(["?"] * len(present))

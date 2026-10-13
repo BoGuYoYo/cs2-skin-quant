@@ -578,8 +578,9 @@ def test_listings_cross_midnight_and_stale_guard() -> None:
 
         class _FakeDT(_dt):     # 继承真 datetime：只替换 now()，其余类方法照常可用
             @staticmethod
-            def now():
-                return seq.pop(0) if seq else _dt(2026, 10, 12, 0, 2)
+            def now(tz=None):   # 生产代码现在会传 BEIJING，签名要跟上
+                v = seq.pop(0) if seq else _dt(2026, 10, 12, 0, 2)
+                return v if tz is None else v.replace(tzinfo=tz)
 
         collector.datetime = _FakeDT        # type: ignore[assignment]
         collector.fetch_prices = lambda chunk, *a, **kw: [   # type: ignore[assignment]
@@ -1391,6 +1392,201 @@ def test_latest_listings_picks_newest_observation() -> None:
         con.close()
 
 
+def test_write_items_keeps_case_linkage() -> None:
+    """[P2] write_items 不许把 cases_build 建立的箱子关联清空。
+
+    审查发现：它用 INSERT OR REPLACE（删行重插），而 case_id / case_name / image
+    恒为 NULL —— 一次 base 同步就会把 42 个箱子的关联全抹掉，
+    核心稀有度特征随即退化成默认值 50。目前只在 items 为空时触发，所以侥幸没炸。
+    """
+    print("\n[39] base 同步不许清空箱子关联")
+    import tempfile  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "items.db")
+        collector.write_items(con, [{"marketHashName": "AK-47 | X (Factory New)",
+                                     "name": "AK-47 | X"}], 1000)
+        # 模拟 cases_build 建立关联
+        con.execute("UPDATE items SET case_id='CaseA', case_name='箱子A', image='http://x' "
+                    "WHERE item_id='AK-47 | X (Factory New)'")
+        con.commit()
+        # 再跑一次 base 同步
+        collector.write_items(con, [{"marketHashName": "AK-47 | X (Factory New)",
+                                     "name": "AK-47 | X 改名"}], 2000)
+        row = con.execute("SELECT name, case_id, case_name, image FROM items "
+                          "WHERE item_id='AK-47 | X (Factory New)'").fetchone()
+        check("箱子关联在 base 同步后仍然存在",
+              row[1] == "CaseA" and row[2] == "箱子A", f"{tuple(row)}")
+        check("图片也没被清掉", row[3] == "http://x", f"{row[3]}")
+        check("而 base 提供的名字确实更新了", row[0] == "AK-47 | X 改名", f"{row[0]}")
+        con.close()
+
+    src = (SERVER / "pipeline" / "collector.py").read_text(encoding="utf-8")
+    check("write_items 不再用 INSERT OR REPLACE",
+          "INSERT OR REPLACE INTO items" not in src)
+
+
+def test_case_rarity_by_day_no_lookahead() -> None:
+    """[P2] 逐日稀有度必须优先于静态稀有度（否则回测有前视泄漏）。
+
+    审查发现：case_meta 的 rarity_score 是用**今天**的箱价/趋势算的，
+    却被 merge 到全部历史日期 —— 等于让 2025-10 的样本提前知道 2026-10 的箱价。
+    """
+    print("\n[40] 逐日稀有度消除前视泄漏")
+    import tempfile  # noqa: PLC0415
+
+    from pipeline import cases_build  # noqa: PLC0415
+
+    # ① 静态 vs 逐日：历史行必须用当天的值
+    days = pd.date_range("2026-01-01", periods=40, freq="D")
+    hist = pd.DataFrame([{"item_id": "A", "date": d, "price": 100.0, "bid": None,
+                          "listings": 30, "volume": None, "supply": None,
+                          "case_id": "CaseA"} for d in days])
+    case_df = pd.DataFrame([{"case_id": "CaseA", "case_name": "A",
+                             "rarity_score": 90.0, "drop_pool": "removed"}])
+    case_hist = pd.DataFrame([
+        {"case_id": "CaseA", "date": pd.Timestamp("2026-01-10"), "rarity_score": 20.0},
+        {"case_id": "CaseA", "date": pd.Timestamp("2026-01-20"), "rarity_score": 30.0},
+    ])
+    feats = features.build(hist, case_df, None, None, case_hist)
+    got = dict(zip(feats["date"].dt.strftime("%Y-%m-%d"), feats["case_rarity_score"]))
+    check("历史表覆盖到的日期用当天的稀有度（不是静态 90）",
+          got.get("2026-01-10") == 20.0 and got.get("2026-01-20") == 30.0,
+          f"01-10={got.get('2026-01-10')} 01-20={got.get('2026-01-20')}")
+    check("历史表没覆盖的日期退回静态值（不能变 NaN）",
+          got.get("2026-01-25") == 90.0, f"{got.get('2026-01-25')}")
+
+    # ② build_history 真能产出逐日行，且同一天不同日期分数不同
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "ch.db")
+        con.execute("INSERT INTO items (item_id, name, market_hash_name) VALUES (?,?,?)",
+                    ("CaseA", "箱子A", "CaseA"))
+        con.execute("INSERT INTO items (item_id, name, market_hash_name) VALUES (?,?,?)",
+                    ("AK | X", "AK", "AK-47 | X"))
+        # 箱子价格随时间上涨 → 稀有度应当随日期变化
+        for i, d in enumerate(pd.date_range("2026-06-01", periods=40, freq="D")):
+            price = 10.0 + i
+            con.execute("INSERT INTO snap (item_id, date, sell) VALUES (?,?,?)",
+                        ("CaseA", d.strftime("%Y-%m-%d"), price))
+            con.execute("INSERT INTO snap (item_id, date, sell) VALUES (?,?,?)",
+                        ("AK | X", d.strftime("%Y-%m-%d"), price * 3))
+        con.commit()
+        cases = [{"case_id": "CaseA", "case_name": "箱子A", "first_sale_date": "2015/01/01",
+                  "contains": [{"name": "AK-47 | X"}]}]
+        n = cases_build.build_history(con, cases)
+        rows = con.execute("SELECT date, rarity_score FROM case_history "
+                           "WHERE case_id='CaseA' ORDER BY date").fetchall()
+        check("产出逐日稀有度", n > 10 and len(rows) == n, f"n={n} rows={len(rows)}")
+        check("稀有度随日期变化（不是一天的常数）",
+              len({r[1] for r in rows}) > 1, f"{sorted({r[1] for r in rows})[:5]}")
+        # 口径一致性：年龄(30分)与箱内中位价(10分)必须真的参与计算。
+        # 踩过的坑：一开始把 build() 的输出当 cases 传进去，那两个字段不存在，
+        # 于是分数只剩「箱价」那 45 分那一档（85 分算成 45 分）。
+        last_score = rows[-1][1]
+        check("最后一天的分数包含年龄与箱内中位价分量（不是只剩箱价分）",
+              last_score > 45, f"last={last_score}")
+        con.close()
+
+    src = (SERVER / "pipeline" / "features.py").read_text(encoding="utf-8")
+    check("features.build 支持 case_hist 并按 (case_id, date) 合并",
+          "case_hist" in src and 'on=["case_id", "date"]' in src)
+    rd = (SERVER / "pipeline" / "run_daily.py").read_text(encoding="utf-8")
+    check("run_daily 会载入 case_history 并传给特征",
+          "_load_case_history" in rd and "case_hist=case_hist" in rd)
+
+
+def test_push_replace_semantics() -> None:
+    """[P1] 云端整表替换/按时间替换/部分失败可见 —— 三条通道接口必须一致。"""
+    print("\n[41] 推送替换语义")
+    import tempfile  # noqa: PLC0415
+
+    import push.to_local as tl  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        real = tl._DB_PATH
+        tl._DB_PATH = Path(td) / "push.db"       # type: ignore[assignment]
+        conn = tl.connect()
+        try:
+            # factor_latest：整表替换 —— 本轮没入选的品种必须消失
+            tl.push("factor_latest", [{"item_id": "A", "date": "2026-10-13", "price": 1.0,
+                                       "updated_at": 1}])
+            tl.push("factor_latest", [{"item_id": "B", "date": "2026-10-13", "price": 2.0,
+                                       "updated_at": 2}])
+            check("两次推送累积两行", conn.execute(
+                "SELECT COUNT(*) FROM factor_latest").fetchone()[0] == 2)
+            tl.push("factor_latest", [{"item_id": "A", "date": "2026-10-13", "price": 3.0,
+                                       "updated_at": 3}], replace_all=True)
+            left = [r[0] for r in conn.execute("SELECT item_id FROM factor_latest ORDER BY 1")]
+            check("replace_all 后只剩本轮那一行（B 被清掉）", left == ["A"], f"{left}")
+
+            # alerts：按时间戳划界替换（只有 ts、没有 date）
+            tl.push("alerts", [{"item_id": "A", "level": "L3", "ts": 100, "score": 1.0}])
+            tl.push("alerts", [{"item_id": "A", "level": "L3", "ts": 200, "score": 1.0}])
+            check("同日重跑前有两行（模拟重复）", conn.execute(
+                "SELECT COUNT(*) FROM alerts").fetchone()[0] == 2)
+            tl.push("alerts", [{"item_id": "A", "level": "L3", "ts": 300, "score": 2.0}],
+                    replace_since_ts=150)
+            n = conn.execute("SELECT COUNT(*) FROM alerts WHERE ts >= 150").fetchone()[0]
+            check("replace_since_ts 清掉旧的当日告警", n == 1, f"剩余 {n} 行")
+        finally:
+            conn.close()
+            tl._DB_PATH = real       # type: ignore[assignment]
+
+    cf = (SERVER / "push" / "to_cloudflare.py").read_text(encoding="utf-8")
+    d1 = (SERVER / "push" / "to_d1.py").read_text(encoding="utf-8")
+    ing = (SERVER.parent / "worker" / "routes" / "ingest.ts").read_text(encoding="utf-8")
+    check("to_cloudflare 透传 replaceSince / replaceAll",
+          "replaceSince" in cf and "replaceAll" in cf)
+    check("to_d1 支持 replace_all 与 replace_since_ts",
+          "replace_since_ts" in d1 and "replace_all" in d1)
+    check("Worker 的 replaceAll 只对白名单表生效",
+          "REPLACE_ALL_STAGES" in ing and "不支持 replaceAll" in ing)
+    check("Worker 支持按 ts 划界删除（alerts）", "replaceSince" in ing)
+
+    dp = (SERVER / "push" / "dispatch.py").read_text(encoding="utf-8")
+    check("部分通道失败要显式抛出（不再静默降级）", "PartialPushError" in dp)
+    rd = (SERVER / "pipeline" / "run_daily.py").read_text(encoding="utf-8")
+    check("run_daily 会记录部分失败但继续推剩余 stage",
+          "except dispatch.PartialPushError" in rd)
+    check("factor_latest 推送带 replace_all", '"replace_all": True' in rd)
+    check("alerts 推送带 replace_since_ts", '"replace_since_ts": day_start' in rd)
+
+
+def test_misc_hardening() -> None:
+    """[P3] 零散加固：日期口径、子查询范围、切分守卫、死代码、鉴权比较、cron 清理。"""
+    print("\n[42] 零散加固")
+    import tempfile  # noqa: PLC0415
+
+    col = (SERVER / "pipeline" / "collector.py").read_text(encoding="utf-8")
+    check("collect_listings 用 BEIJING 而不是裸 datetime.now()",
+          "datetime.now().strftime" not in col and "datetime.now(BEIJING)" in col)
+    check("latest_listings 的内层子查询也按品种过滤",
+          'inner_conds.insert(0' in col)
+
+    rd = (SERVER / "pipeline" / "run_daily.py").read_text(encoding="utf-8")
+    check("训练段为空时显式报错（不再以难懂的方式炸在 LightGBM 里）",
+          "样本日期跨度不足" in rd)
+
+    dec = (SERVER / "pipeline" / "decide.py").read_text(encoding="utf-8")
+    check("死代码 min(cfg.unit, ...) 已移除",
+          "min(cfg.unit, cfg.unit * kelly * 0.5)" not in dec)
+
+    app = (SERVER / "app.py").read_text(encoding="utf-8")
+    check("写接口鉴权用常数时间比较", "hmac.compare_digest" in app)
+
+    cron = (SERVER.parent / "worker" / "cron.ts").read_text(encoding="utf-8")
+    check("cron 会清理 runs（否则日志表只增不减）", "runs_pruned" in cron)
+
+    # _split_tail 的守卫：样本全挤在 horizon 天内时训练段为空 → 必须报错
+    from pipeline.run_daily import _split_tail  # noqa: PLC0415
+
+    dense = pd.DataFrame([{"date": pd.Timestamp("2026-10-01") + pd.Timedelta(hours=i)}
+                          for i in range(400)])
+    tr, cal = _split_tail(dense, 0.8, 21)
+    check("日期跨度不足时训练段确实为空（这就是需要守卫的场景）",
+          tr.empty and not cal.empty, f"train={len(tr)} calib={len(cal)}")
+
+
 def main() -> int:
     print("=" * 62)
     print("回归测试：每条对应一个真实踩过的坑")
@@ -1433,6 +1629,10 @@ def main() -> int:
     test_stale_forecast_marked_on_detail_page()
     test_stale_quote_never_enters_history()
     test_latest_listings_picks_newest_observation()
+    test_write_items_keeps_case_linkage()
+    test_case_rarity_by_day_no_lookahead()
+    test_push_replace_semantics()
+    test_misc_hardening()
     print("\n" + "=" * 62)
     if FAIL:
         print(f"结果：{len(FAIL)} 项失败 → {FAIL}")

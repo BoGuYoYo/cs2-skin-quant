@@ -4,6 +4,9 @@ import type { Env } from '../index';
 export function safeEqual(a: string, b: string): boolean {
   const ae = new TextEncoder().encode(a);
   const be = new TextEncoder().encode(b);
+  // ⚠️ 长度不等时直接返回虽然不可避免（要逐字节比较就得等长），
+  // 但它确实泄漏了「长度」这一位信息 —— 长度本身不是秘密（token 是固定长度随机串），
+  // 所以这里保留早退，只是把注释写清楚，别让人以为整个函数是严格常数时间的。
   if (ae.length !== be.length) return false;
   let diff = 0;
   for (let i = 0; i < ae.length; i++) diff |= ae[i] ^ be[i];

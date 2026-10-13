@@ -142,6 +142,15 @@ def load_or_train(cfg: Cfg, labeled: pd.DataFrame) -> tuple[QuantileModel, CQR, 
         mdl = QuantileModel.load(cfg.model_path)
     else:
         train_part, calib_part = _split_tail(mature, 0.8, cfg.horizon)
+        # ⚠️ 行数够 ≠ 能用（审查发现）：按日期切完还要 purge 掉 horizon 天，
+        # 如果样本全挤在 horizon 天之内（比如冷启动刚积累几天行情），
+        # 训练段会是**空的** —— 那只会以更难懂的方式炸在 LightGBM 里。
+        # 显式报错，交给既有的冷启动分支处理（它会照常推送基础数据）。
+        if len(train_part) < 300:
+            raise RuntimeError(
+                f"训练段只有 {len(train_part)} 行：样本日期跨度不足 {cfg.horizon} 天，"
+                f"按日期隔离标签窗口后没有可用训练数据 —— 等行情自然积累几天再跑"
+            )
         w = labels.sample_weights(train_part, cfg)
         log.info("训练：%d 行 × %d 特征", len(train_part), len(FEATURE_COLS))
         mdl = model_train(train_part, w, cfg)
@@ -332,6 +341,7 @@ def _load_feats_batched(
     events_df: pd.DataFrame | None,
     cfg: Cfg,
     only_latest: bool = False,
+    case_hist: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """按品种分块算特征，把峰值内存压到 1/N。
 
@@ -356,7 +366,7 @@ def _load_feats_batched(
         h = collector.load_history(con, days=days, items=chunk)
         if h.empty:
             continue
-        f = features.build(h, case_df, index_df, events_df)
+        f = features.build(h, case_df, index_df, events_df, case_hist)
         del h
         out = features.latest_cross_section(f) if only_latest else f
         del f
@@ -509,6 +519,7 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
     case_df = pd.DataFrame(cases_mod.load_cases(con))
     index_df = _load_index(con)
     events_df = _load_events(con)
+    case_hist = _load_case_history(con)
 
     all_items = _snap_items(con)
     if not all_items:
@@ -526,7 +537,8 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
         log.info("训练集抽样 %d/%d 个品种（内存约束，TRAIN_ITEM_LIMIT 可调）",
                  len(train_items), len(all_items))
 
-    feats = _load_feats_batched(con, train_items, 1200, case_df, index_df, events_df, cfg)
+    feats = _load_feats_batched(con, train_items, 1200, case_df, index_df, events_df, cfg,
+                                case_hist=case_hist)
     if feats.empty:
         log.error("特征宽表为空，无法继续")
         return 4
@@ -566,7 +578,8 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
     # 推理要覆盖全部品种（16k 个），但每个品种只需要最后一行 →
     # 分块算特征、每块只留截面，内存与历史长度解耦。
     latest = _load_feats_batched(
-        con, all_items, cfg.infer_days, case_df, index_df, events_df, cfg, only_latest=True
+        con, all_items, cfg.infer_days, case_df, index_df, events_df, cfg,
+        only_latest=True, case_hist=case_hist,
     )
     if latest.empty:
         log.error("推理截面为空，无法继续")
@@ -746,8 +759,13 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
     # 日线策略一天一份快照，所以推送前先清掉当天的旧记录。
     # 「今天」按北京零点划界 —— day 现在就是北京日期，别再当 UTC 解释
     # （原先 replace(tzinfo=utc) 会把这 8 小时算错，跨零点的告警清不掉）。
+    #
+    # ⚠️ 这句只删**本地**（审查发现）：云端那份没有等价物 —— Worker 侧 alerts
+    # 的 pk 是 []，INSERT OR REPLACE 没有冲突键就退化成普通插入，而 replaceDate
+    # 又只对含 date 的表生效（alerts 只有 ts）。所以推送时还要带上
+    # replace_since_ts，让云端也按同一个时间界删一遍。
+    day_start = day_start_ts(day)
     try:
-        day_start = day_start_ts(day)
         n_del = con.execute("DELETE FROM alerts WHERE ts >= ?", (day_start,)).rowcount
         con.commit()
         if n_del:
@@ -760,9 +778,11 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
         for stage, rows, kw in [
             ("items", item_rows, {}),
             ("case_meta", case_rows, {}),
-            ("factor_latest", factor_rows, {}),
+            # factor_latest 是「当前截面」：必须整表替换，否则本轮被闸门剔掉的
+            # 品种会留着旧行，而筛选接口不看日期 —— 旧行会一直被当成当前结果
+            ("factor_latest", factor_rows, {"replace_all": True}),
             ("forecast", forecast_rows, {"replace_date": day}),
-            ("alerts", alert_rows, {}),
+            ("alerts", alert_rows, {"replace_since_ts": day_start}),
             (
                 "meta",
                 [
@@ -787,7 +807,15 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
                 {},
             ),
         ]:
-            dispatch.push(stage, rows, **kw)
+            try:
+                dispatch.push(stage, rows, **kw)
+            except dispatch.PartialPushError as e:
+                # 部分通道失败（both 模式常见：本地写完、云端挂了）。
+                # 必须记进 fails 让这轮显式降级，但**不能中断剩余 stage** ——
+                # 否则紧跟其后的 meta（含 last_run）写不进去，
+                # 全部预测都会被详情页判成「历史」，那才是更大的误伤。
+                fails.append(f"{stage} 部分通道失败: {e}")
+                log.error("stage=%s 部分通道失败：%s", stage, e)
     except Exception as e:
         fails.append(f"推送失败: {e}")
         log.error("推送失败：%s", e)
@@ -858,6 +886,28 @@ def _i(v: Any) -> int | None:
 def _name_of(con, item_id: str) -> str | None:
     r = con.execute("SELECT name FROM items WHERE item_id = ?", (item_id,)).fetchone()
     return r[0] if r else None
+
+
+def _load_case_history(con) -> pd.DataFrame | None:
+    """逐日箱子稀有度（cases_build.build_history 产出）。
+
+    有它才能消掉回测里的前视泄漏：case_meta 的 rarity_score 是"今天"算的，
+    而历史样本不该看到今天的箱价信息。表不存在就返回 None（退回静态值，
+    行为与以前一致，不会让管线挂掉）。
+    """
+    try:
+        df = pd.read_sql_query(
+            "SELECT case_id, date, rarity_score FROM case_history", con)
+        if df.empty:
+            log.warning("case_history 为空：稀有度仍用静态值（回测会偏乐观），"
+                        "跑一次 python -m pipeline.cases_build 补上逐日稀有度")
+            return None
+        log.info("逐日稀有度载入 %d 行（%d 个箱子）",
+                 len(df), df["case_id"].nunique())
+        return df
+    except Exception as e:      # noqa: BLE001
+        log.warning("case_history 不可用（%s）：稀有度退回静态值", e)
+        return None
 
 
 def _load_index(con) -> pd.DataFrame | None:

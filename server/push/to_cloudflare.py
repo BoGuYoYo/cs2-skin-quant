@@ -66,6 +66,8 @@ def push(
     *,
     replace_date: str | None = None,
     replace_series: str | None = None,
+    replace_since_ts: int | None = None,
+    replace_all: bool = False,
 ) -> int:
     """把一个 stage 的数据推送到 D1，返回写入行数。
 
@@ -73,6 +75,8 @@ def push(
         stage: ingest.ts 中 STAGES 的键（snap_daily / forecast / items / ...）
         replace_date: 先删掉该日期的旧数据（幂等重跑）
         replace_series: 先删掉该 item_id 的旧数据（items / case_meta / factor_latest 用）
+        replace_since_ts: 先删掉 ts >= 该值的旧数据（alerts 这种只有 ts 的表用）
+        replace_all: 整表替换（只允许「当前截面」型表，见 Worker 的 REPLACE_ALL_STAGES）
     """
     rows = list(rows)
     if not rows:
@@ -90,6 +94,10 @@ def push(
             payload["replaceDate"] = replace_date
         if first and replace_series:
             payload["replaceSeries"] = replace_series
+        if first and replace_since_ts is not None:
+            payload["replaceSince"] = replace_since_ts
+        if first and replace_all:
+            payload["replaceAll"] = True
         res = _post(payload)
         inserted += int(res.get("inserted", 0))
         log.info("stage=%s 分块 %d/%d 写入 %d 行", stage, i // CHUNK + 1, total_chunks, res.get("inserted", 0))

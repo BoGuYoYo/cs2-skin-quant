@@ -29,9 +29,11 @@ import re
 import sqlite3
 import sys
 from collections import Counter, defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+import pandas as pd
 
 try:
     from dotenv import load_dotenv
@@ -239,6 +241,113 @@ def build(con: sqlite3.Connection) -> tuple[list[dict], dict[str, str], dict[str
     return out, item_to_case, item_to_cname
 
 
+CASE_HISTORY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS case_history (
+  case_id TEXT, date TEXT, rarity_score REAL, case_price REAL, drop_pool TEXT,
+  PRIMARY KEY (case_id, date)
+);
+CREATE INDEX IF NOT EXISTS ix_case_history ON case_history(case_id, date);
+"""
+
+
+def build_history(con: sqlite3.Connection, cases: list[dict], lookback_days: int = 420) -> int:
+    """按**每个交易日**复算箱子稀有度，写进 case_history。
+
+    为什么必须这么做（审查发现的前视泄漏）：
+        rarity_score 是用**今天的**箱价、今天往前 30 天的趋势、今天的箱内物品
+        中位价算出来的，而 features.build 把它 merge 到**全部历史日期**上 ——
+        等于让 2025-10 的训练样本用上了 2026-10 的箱价信息，而箱价本身编码了
+        「这一年谁涨谁跌」。walk-forward 的 purge/embargo 只能隔开时间，
+        拦不住「静态特征里带未来」。
+    现在每个日期只用那一天能看见的数据，公式与 rarity_score() 完全一致：
+        那天的箱价 + 那天的年龄 + 那天往前 30 天的箱价趋势 + 那天的箱内中位价。
+
+    ⚠️ cases 必须是 **crates.json 的原始条目**（带 first_sale_date 和 contains），
+    不能传 build() 的输出 —— 那个输出里没有这两个字段，传错的话年龄恒为 0、
+    箱内中位价恒为 None，分数会系统性偏低约 40 分（实测踩过：85 分算成 45 分）。
+
+    返回写入行数。
+    """
+    con.executescript(CASE_HISTORY_SCHEMA)
+    cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+
+    # 箱子 → 物品（本地 item_id），沿用 build() 的口径
+    item_rows = con.execute("SELECT item_id, market_hash_name FROM items").fetchall()
+    by_base: dict[str, list[str]] = defaultdict(list)
+    for item_id, mhn in item_rows:
+        by_base[base_name(mhn or item_id)].append(item_id)
+
+    total = 0
+    con.execute("DELETE FROM case_history WHERE date >= ?", (cutoff,))
+    for c in cases:
+        cid = c.get("case_id") or c.get("market_hash_name")
+        if not cid:
+            continue
+        ids: list[str] = []
+        for it in c.get("contains") or []:
+            b = base_name(it.get("name"))
+            if b:
+                ids.extend(by_base.get(b, []))
+        if not ids:
+            continue
+
+        # 箱价序列
+        box = pd.read_sql_query(
+            "SELECT date, sell AS price FROM snap WHERE item_id = ? AND sell > 0 "
+            " AND date >= ? ORDER BY date", con, params=(cid, cutoff))
+        if box.empty:
+            continue
+        box["date"] = pd.to_datetime(box["date"])
+        box = box.drop_duplicates("date").set_index("date")["price"].astype(float)
+        dates = box.index
+
+        # 箱内物品价格中位数（按日）
+        med = None
+        ph = ",".join(["?"] * len(ids))
+        ip = pd.read_sql_query(
+            f"SELECT date, sell AS price FROM snap WHERE item_id IN ({ph}) "
+            f" AND sell > 0 AND date >= ?", con, params=ids + [cutoff])
+        if not ip.empty:
+            ip["date"] = pd.to_datetime(ip["date"])
+            med = ip.groupby("date")["price"].median()
+
+        # 年龄（按天算，随日期变化）
+        fsd = c.get("first_sale_date")
+        first: date | None = None
+        if fsd:
+            for fmt in ("%Y/%m/%d", "%Y-%m-%d"):
+                try:
+                    first = datetime.strptime(fsd, fmt).date()
+                    break
+                except ValueError:
+                    continue
+
+        rows = []
+        for d in dates:
+            p = float(box.loc[d])
+            # 趋势：该日往前 30 个采样点（与 cases_build.price_trend 同口径）
+            prior = box.loc[:d]
+            trend = None
+            if len(prior) >= 2:
+                back = float(prior.iloc[0] if len(prior) <= 30 else prior.iloc[-30])
+                if back > 0:
+                    trend = p / back - 1.0
+            age_years = ((d.date() - first).days / 365.25) if first else 0.0
+            item_median = float(med.loc[d]) if (med is not None and d in med.index) else None
+            score, _ = rarity_score(p, age_years, item_median, trend)
+            rows.append((cid, d.strftime("%Y-%m-%d"), score, round(p, 2),
+                         infer_drop_pool(p, age_years)))
+        if rows:
+            con.executemany(
+                "INSERT OR REPLACE INTO case_history "
+                "(case_id, date, rarity_score, case_price, drop_pool) VALUES (?,?,?,?,?)",
+                rows)
+            total += len(rows)
+            con.commit()
+    log.info("case_history 写入 %d 行（%d 个箱子的逐日稀有度）", total, len(cases))
+    return total
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="构建 case_meta")
     ap.add_argument("--status", action="store_true", help="只看状态")
@@ -257,11 +366,24 @@ def main() -> int:
             print(f"    {r[0]:<44} {r[1]:>5}  ¥{r[2] or 0:>8.2f}  {r[3]}")
         items_with_case = con.execute("SELECT COUNT(*) FROM items WHERE case_id IS NOT NULL").fetchone()[0]
         print(f"  已关联箱子的物品: {items_with_case}")
+        try:
+            hn = con.execute("SELECT COUNT(*) FROM case_history").fetchone()[0]
+            print(f"  case_history 逐日稀有度: {hn} 行")
+        except sqlite3.OperationalError:
+            print("  case_history 逐日稀有度: 还没建（跑一次不带 --status 的构建）")
         return 0
 
     log.info("读取 crates.json …")
     cases, item_to_case, item_to_cname = build(con)
     log.info("构建完成：%d 个箱子，%d 个物品可关联", len(cases), len(item_to_case))
+
+    # 逐日稀有度（消掉回测里的前视泄漏，见 build_history 的说明）。
+    # ⚠️ 必须传 crates.json 的**原始条目**：build() 的输出里没有
+    # first_sale_date / contains，传错会让年龄恒 0、箱内中位价恒 None。
+    try:
+        build_history(con, load_cases())
+    except Exception as e:      # noqa: BLE001
+        log.warning("case_history 构建失败（不影响 case_meta）：%s", e)
 
     # 写 case_meta（先删掉已不存在的箱子，避免残留）
     current = {c["case_id"] for c in cases}

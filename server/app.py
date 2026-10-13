@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import sqlite3
@@ -94,9 +95,16 @@ def ok(data: Any) -> dict[str, Any]:
 
 
 def _auth(authorization: str | None) -> None:
+    """写接口鉴权。
+
+    用 hmac.compare_digest 而不是 != （审查发现同类问题）：
+    Python 的字符串比较会在第一个不同字符处短路，理论上可被计时攻击逐字符猜出 token。
+    本地 API 只监听回环、风险很低，但既然 Worker 侧专门写了 safeEqual，
+    这边没有理由用不等价强度的写法。
+    """
     if not TOKEN:
         raise HTTPException(500, "INGEST_TOKEN 未在服务器上配置")
-    if authorization != f"Bearer {TOKEN}":
+    if not authorization or not hmac.compare_digest(authorization, f"Bearer {TOKEN}"):
         raise HTTPException(401, "unauthorized")
 
 

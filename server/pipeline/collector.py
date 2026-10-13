@@ -541,7 +541,12 @@ def collect_listings(
     # 一轮接一轮），算一次的话跨过午夜后，第二天的新报价会继续写进
     # 前一天的记录里 —— 等于用第二天的盘中价覆盖第一天的收盘价。
     # 实测：1,994 行 2026-10-11 的数据是 10-12 凌晨 01:29 写的。
-    day = datetime.now().strftime("%Y-%m-%d")
+    #
+    # ⚠️ 而且必须用 BEIJING（审查发现）：这里是裸 datetime.now()，
+    # 用的是服务器本地时区；同一份数据在 write_daily_snapshot 里又按 BEIJING
+    # 比较观测日期 —— 服务器一旦不是 +08，两套口径就会在日界附近打架。
+    # config 已明确「任何按天划界的地方都必须用 BEIJING」，这里不能例外。
+    day = datetime.now(BEIJING).strftime("%Y-%m-%d")
     stats = {"batches": 0, "items": 0, "rows": 0, "fail": 0, "day": day}
     if not names:
         return stats
@@ -574,7 +579,7 @@ def collect_listings(
             continue
 
         # 每批重新取日期：常驻服务会跨午夜，不能把启动日期一路用下去
-        new_day = datetime.now().strftime("%Y-%m-%d")
+        new_day = datetime.now(BEIJING).strftime("%Y-%m-%d")
         if new_day != day:
             log.info("挂单量采集：跨日 %s → %s，后续行情写入新日期（旧日期不再改动）",
                      day, new_day)
@@ -604,6 +609,14 @@ def write_items(con: sqlite3.Connection, base: list[dict[str, Any]], now: int) -
        而这里原先写的是 BUFF goods_id（纯数字），导致 items 与
        forecast / snap / kline 全都 JOIN 不上 —— 前端候选池的名字、图片全为 null。
        平台的 itemId 属于映射信息，需要时再从 /base 取，不该混进主键。
+
+    ⚠️ 绝对不能用 INSERT OR REPLACE（审查发现）。
+       它的语义是「删行重插」，而这里 case_id / case_name / image 恒为 NULL ——
+       于是 cases_build 用 UPDATE 建立起来的箱子关联会被整片抹掉，
+       核心稀有度特征（case_rarity_score）随即退化成默认值 50。
+       现在改成只更新「/base 真的提供的那几列」，关联列由 cases_build 负责，
+       两边各管各的，谁也覆盖不了谁。
+       （同类坑在本文件其它地方也踩过：只有 snap 保留了 COALESCE 语义。）
     """
     n = 0
     for it in base:
@@ -611,10 +624,14 @@ def write_items(con: sqlite3.Connection, base: list[dict[str, Any]], now: int) -
         if not mhn:
             continue
         con.execute(
-            """INSERT OR REPLACE INTO items
-               (item_id, name, market_hash_name, wear, case_id, case_name, image, updated_at)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (mhn, it.get("name"), mhn, _wear(mhn), None, None, None, now),
+            """INSERT INTO items (item_id, name, market_hash_name, wear, updated_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(item_id) DO UPDATE SET
+                 name            = COALESCE(excluded.name, items.name),
+                 market_hash_name = COALESCE(excluded.market_hash_name, items.market_hash_name),
+                 wear            = COALESCE(excluded.wear, items.wear),
+                 updated_at      = excluded.updated_at""",
+            (mhn, it.get("name"), mhn, _wear(mhn), now),
         )
         n += 1
     con.commit()
@@ -958,12 +975,16 @@ def latest_listings(con: sqlite3.Connection, items: list[str] | None = None) -> 
     两者按品种关联。返回 item_id / listings / listings_date / count_ts。
     """
     conds = ["s.listings IS NOT NULL"]
+    inner_conds = ["listings IS NOT NULL"]
     params: list[Any] = []
     if items is not None:
         if not items:
             return pd.DataFrame()
-        conds.insert(0, "s.item_id IN (%s)" % ",".join(["?"] * len(items)))
-        params = list(items)
+        ph = ",".join(["?"] * len(items))
+        conds.insert(0, f"s.item_id IN ({ph})")
+        inner_conds.insert(0, f"item_id IN ({ph})")
+        # 参数顺序跟着 SQL 文本：内层子查询在前，外层 WHERE 在后
+        params = list(items) + list(items)
 
     df = pd.read_sql_query(
         # ⚠️ 选「最新**观测**」，不是「最新**行**」（审查发现）：
@@ -971,11 +992,14 @@ def latest_listings(con: sqlite3.Connection, items: list[str] | None = None) -> 
         # 缓存数量 100」时，会选中今天那行旧缓存，再因为过期被判成"不知道"而放行 ——
         # 昨天那条**仍然有效**的 0 反而被丢掉了。
         # 所以排序键用 count_ts（没有 count_ts 的老行退回入库日期）。
+        #
+        # ⚠️ 内层子查询也要带上品种过滤（审查发现）：否则每次都在 540 万行的
+        # snap 上做全表 GROUP BY，而调用方其实只关心当前这批品种。
         "SELECT s.item_id, s.listings, s.date AS listings_date, s.count_ts "
         "  FROM snap s "
         "  JOIN (SELECT item_id,"
         "               MAX(COALESCE(count_ts, CAST(strftime('%s', date) AS INTEGER))) AS k"
-        "          FROM snap WHERE listings IS NOT NULL GROUP BY item_id) m "
+        "          FROM snap WHERE " + " AND ".join(inner_conds) + " GROUP BY item_id) m "
         "    ON m.item_id = s.item_id "
         "   AND COALESCE(s.count_ts, CAST(strftime('%s', s.date) AS INTEGER)) = m.k "
         " WHERE " + " AND ".join(conds),

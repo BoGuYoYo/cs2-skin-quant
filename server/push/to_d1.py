@@ -266,6 +266,8 @@ def push(
     *,
     replace_date: str | None = None,
     replace_series: str | None = None,
+    replace_since_ts: int | None = None,
+    replace_all: bool = False,
 ) -> int:
     """把一个 stage 的数据推送到 D1（接口与 to_cloudflare.push 一致）"""
     cols = STAGES.get(stage)
@@ -281,10 +283,17 @@ def push(
     changed = 0
 
     # 幂等重跑：先删旧的
+    if replace_all:
+        changed += _query(f"DELETE FROM {table}", [])
     if replace_date and "date" in cols:
         changed += _query(f"DELETE FROM {table} WHERE date = ?", [replace_date])
     if replace_series and "item_id" in cols:
         changed += _query(f"DELETE FROM {table} WHERE item_id = ?", [replace_series])
+    # alerts 这类「只有 ts、没有 date」的表按时间戳划界删（否则同日重跑会翻倍）
+    if replace_since_ts is not None and "ts" in cols:
+        changed += _query(f"DELETE FROM {table} WHERE ts >= ?", [replace_since_ts])
+    elif replace_since_ts is not None:
+        log.warning("stage=%s 不支持 replace_since_ts（没有 ts 列），本次未做按时间替换", stage)
 
     if USE_PARAMS:
         # 参数绑定模式：每语句最多 100 个参数，慢但完全免注入（D1_USE_PARAMS=1 才启用）

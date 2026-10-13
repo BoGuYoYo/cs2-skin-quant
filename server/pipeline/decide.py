@@ -135,7 +135,10 @@ def decide(row: dict[str, Any], cfg: Cfg) -> dict[str, Any]:
     risk = max(p50 - p10, 1e-6)
     ratio = p50 / risk
     kelly = max(0.0, min(1.0, (ratio - 1.0) / ratio)) if ratio > 1 else 0.0
-    size = min(cfg.unit, cfg.unit * kelly * 0.5)   # 半 Kelly 再打对折
+    # 半 Kelly 再打对折。注意 kelly ∈ [0,1]，所以 unit*kelly*0.5 ≤ unit/2 < unit ——
+    # 原先外面套了个 min(cfg.unit, ...)，那个 min 永远取不到 cfg.unit（审查发现
+    # 是死代码），去掉以免让人以为"满仓上限"真的会生效。
+    size = cfg.unit * kelly * 0.5
 
     days = row.get("drop_duration_days")
     fit_note = ""
