@@ -209,6 +209,71 @@ def _apply_liquidity_gate(latest: pd.DataFrame, cfg: Cfg) -> pd.DataFrame:
     return latest[keep].reset_index(drop=True)
 
 
+def abort_no_cross_section(con, day: str, dry_run: bool) -> None:
+    """截面被闸门清空时的收尾：把「今天没有截面」这件事真正落实到库里。
+
+    为什么两张表都要清（而不是只清 factor_latest）：
+      - factor_latest：/api/screener 只按 price/rarity 过滤、**不看日期**，
+        旧行会继续被当成现价展示；
+      - forecast（今天那批）：/api/candidates 用 `date = MAX(date)` +
+        LEFT JOIN factor_latest，于是会出现「因子已被清空、却仍在推荐买入」
+        的假候选（价格字段变 null，但 side='buy' 还在）。
+    不处理的后果就是页面在推荐一批不存在的标的。
+
+    ⚠️ --dry-run 的约定是「什么也不改」。审查发现原实现的这个分支
+    先执行了 prune 再检查 dry_run —— 试跑会删真实数据，这是最不该有的行为。
+    """
+    if dry_run:
+        log.warning("--dry-run：跳过清理，不改动任何数据")
+        return
+    n1 = prune_factor_latest(con, [])
+    n2 = 0
+    try:
+        n2 = con.execute("DELETE FROM forecast WHERE date = ?", (day,)).rowcount
+        con.commit()
+    except Exception as e:      # noqa: BLE001
+        log.warning("清理今日 forecast 失败：%s", e)
+    log.warning("已清理 factor_latest %d 条、今日 forecast %d 条（本轮无截面）", n1, n2 or 0)
+
+
+def _apply_freshness_gate(latest: pd.DataFrame, cfg: Cfg) -> pd.DataFrame:
+    """只预测「行情够新、且特征窗口已预热」的品种。
+
+    踩过的坑（审查指出）：截面取的是「每个品种在这个窗口内的最后一行」，
+    而窗口有 infer_days（默认 120 天）—— 一个 14 天前就没有行情的品种
+    照样进来，然后被写成**今天**的因子和预测（factor_latest.date = day）。
+    旧价格就这么被"重新包装"成今日价格骗过筛选页；而流动性闸门只看挂单量，
+    拦不住这种事。
+
+    is_warm 同理：它本来就是 features.build 里「长窗口特征齐全」的标记，
+    训练时用了、推理时也该用 —— 否则新上架或数据稀疏的品种会拿一大堆
+    ffill + 0 的向量去预测，输出看着正常但没有任何信息。
+    """
+    if latest.empty:
+        return latest
+    n0 = len(latest)
+
+    if "date" in latest.columns:
+        d = pd.to_datetime(latest["date"])
+        ref = d.max()
+        fresh = (ref - d).dt.days <= cfg.infer_max_age_days
+    else:                                   # 理论上不会发生，兜底放行
+        ref, fresh = None, pd.Series(True, index=latest.index)
+
+    if "is_warm" in latest.columns:
+        warm = latest["is_warm"].fillna(False).astype(bool)
+    else:
+        warm = pd.Series(True, index=latest.index)
+
+    keep = fresh & warm
+    dropped_stale = int((~fresh).sum())
+    dropped_cold = int((~(fresh & warm)).sum()) - dropped_stale
+    log.info("新鲜度/预热闸门：参考日 %s，行情超 %d 天的 %d 个、未预热的 %d 个；保留 %d/%d",
+             ref.strftime("%Y-%m-%d") if ref is not None else "?", cfg.infer_max_age_days,
+             dropped_stale, dropped_cold, int(keep.sum()), n0)
+    return latest[keep].reset_index(drop=True)
+
+
 def _load_feats_batched(
     con,
     items: list[str],
@@ -459,16 +524,19 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
         return 6
     log.info("推理截面 %d 行 × %d 列（近 %d 天）", len(latest), latest.shape[1], cfg.infer_days)
 
+    # 先剔掉「行情太旧 / 特征没预热」的品种：它们不该被包装成今天的截面
+    latest = _apply_freshness_gate(latest, cfg)
+    if latest.empty:
+        log.error("新鲜度闸门把截面全部剔除，无法继续")
+        return 6
+
     # 用户规则：日交易量（用挂单量代理）< 20 不看
     latest = _apply_liquidity_gate(latest, cfg)
     if latest.empty:
-        # 连截面都没了：不能就这么 return —— factor_latest 里还留着上一轮的旧行，
-        # 页面上会继续显示它们，而它们既不是今天的、也不是本轮选出来的。
-        # 宁可空着（诚实地表示「今天没有截面」），也不拿旧数据冒充现价。
-        log.error("流动性闸门把截面全部剔除：清掉 factor_latest 旧行后退出")
-        n = prune_factor_latest(con, [])
-        if n:
-            log.warning("已清理 factor_latest %d 条（本轮无截面，不保留旧行）", n)
+        # 连截面都没了：库里还留着上一轮的 factor_latest 与今天的 forecast，
+        # 都不该继续展示（详见 abort_no_cross_section 的注释）。
+        log.error("流动性闸门把截面全部剔除")
+        abort_no_cross_section(con, day, dry_run)
         return 6
     P = mdl.predict(latest[FEATURE_COLS])
 

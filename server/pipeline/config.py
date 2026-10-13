@@ -115,6 +115,13 @@ class Cfg:
     train_item_limit: int = field(default_factory=lambda: _i("TRAIN_ITEM_LIMIT", 4000))
     feat_batch_items: int = field(default_factory=lambda: _i("FEAT_BATCH_ITEMS", 1500))
 
+    #: 推理时允许的「行情最大陈旧天数」。
+    #: 截面是每个品种在 infer_days 窗口里的最后一行，而窗口有 120 天 ——
+    #: 一个两周前就断更的品种照样会被写成**今天**的因子和预测，
+    #: 旧价格被重新包装成今日价格。给 3 天余量：正常情况（每天 07:00 采集）
+    #: 活跃品种的行情日期就是今天，漏跑一天也不至于把它们全丢掉。
+    infer_max_age_days: int = field(default_factory=lambda: _i("INFER_MAX_AGE_DAYS", 3))
+
     def ensure_dirs(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
 

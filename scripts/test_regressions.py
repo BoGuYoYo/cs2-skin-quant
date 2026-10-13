@@ -732,6 +732,21 @@ def test_kline_today_is_guarded_history_is_not() -> None:
         collector.write_kline_rows(con, "H", [[ts_yday, 190.0, 188.0, 191.0, 187.0]])
         got2 = con.execute("SELECT sell FROM snap WHERE item_id='H'").fetchone()[0]
         check("历史日线仍然能定稿覆盖盘中值", got2 == 188.0, f"sell={got2}")
+        kc_h = con.execute("SELECT c FROM kline WHERE item_id='H'").fetchone()
+        check("历史 kline 也同步定稿", abs(float(kc_h[0]) - 188.0) < 1e-9, f"{kc_h}")
+
+        # ③ kline 表必须和 snap 同步受保护，否则「页面价格 175 / 图上画 173」
+        kc_rows = con.execute("SELECT c FROM kline WHERE item_id='T'").fetchall()
+        check("当日旧 K 线不许写进 kline 表（图表不会与价格分裂）",
+              all(abs(float(r[0]) - 173.0) > 1e-9 for r in kc_rows), f"kline={kc_rows}")
+
+        # ④ 更新的当日 K 线应当两边都收
+        collector.write_kline_rows(con, "T", [[quote_ts + 3600, 174.0, 176.0, 177.0, 173.0]])
+        got3 = con.execute("SELECT sell FROM snap WHERE item_id='T'").fetchone()[0]
+        kc3 = con.execute("SELECT c FROM kline WHERE item_id='T'").fetchone()
+        check("更新的当日 K 线两边都写入",
+              abs(got3 - 176.0) < 1e-9 and kc3 is not None and abs(float(kc3[0]) - 176.0) < 1e-9,
+              f"sell={got3} kline_c={kc3}")
         con.close()
 
 
@@ -844,9 +859,19 @@ def test_invalid_quotes_rejected_and_src_filtered() -> None:
             blk("E", 8.0, plat="YOUPIN"),
         ], "2026-10-13")
         rows = dict(con.execute("SELECT item_id, sell FROM snap"))
-        check("只写入合法报价（0/负数/NaN 被丢弃）",
-              set(rows) == {"A", "E"}, f"写入 {sorted(rows)} 共 {n} 条")
-        check("回退来源被如实记录", rows.get("E") == 8.0, f"{rows}")
+        check("无效价格写成 NULL（价格绝不落在序列里）",
+              rows.get("B") is None and rows.get("C") is None and rows.get("D") is None,
+              f"{rows}")
+        check("合法价格正常写入", rows.get("A") == 12.5 and rows.get("E") == 8.0, f"{rows}")
+        cnt = dict(con.execute("SELECT item_id, listings FROM snap"))
+        check("没有在售价时挂单量仍然记录（不因价格无效丢掉整条响应）",
+              cnt.get("B") == 30, f"{cnt}")
+
+        # 审查给的场景：sellPrice=0 且 sellCount=0（当前无人挂售）
+        collector.write_daily_snapshot(con, [blk("Z", 0, cnt=0)], "2026-10-13")
+        z = con.execute("SELECT sell, listings FROM snap WHERE item_id='Z'").fetchone()
+        check("零报价品种：价格 NULL，但挂单量记成 0（闸门可判定为「已知为 0」而不是「不知道」）",
+              z[0] is None and z[1] == 0, f"{tuple(z)}")
 
         # src 过滤：非 BUFF 的行不进模型
         hist = collector.load_history(con, days=30)
@@ -858,6 +883,142 @@ def test_invalid_quotes_rejected_and_src_filtered() -> None:
     bf = (SERVER / "pipeline" / "backfill.py").read_text(encoding="utf-8")
     check("K 线采集透传真实 platform", "write_kline_rows(con, name, rows, src=platform)" in src)
     check("回填也透传 platform", "platform=args.platform" in bf)
+
+
+def test_fallback_never_overwrites_primary_platform() -> None:
+    """[P2] 回退平台不许顶掉 BUFF 行 —— 否则有效历史会被"写没"。
+
+    当时的症状：先有 BUFF ¥52，后来一条**更新的**悠悠有品 ¥50 把整行改成 YOUPIN；
+    而 load_history 会按 src 过滤非 BUFF 行 —— 结果连原来那条有效的 BUFF ¥52
+    也一起消失了。写入时挡掉，才谈得上"过滤"这件事。
+    """
+    print("\n[26] 回退平台不许覆盖主平台")
+    import tempfile  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "fb.db")
+
+        con.execute(collector.SNAP_UPSERT_QUOTE,
+                    ("X", "2026-10-13", 52.0, 52.0, 10, None, None, 1000, "BUFF"))
+        con.commit()
+        con.execute(collector.SNAP_UPSERT_QUOTE,      # 更新，但来源是回退平台
+                    ("X", "2026-10-13", 50.0, 50.0, 12, None, None, 2000, "YOUPIN"))
+        con.commit()
+        row = con.execute("SELECT sell, src FROM snap WHERE item_id='X'").fetchone()
+        check("更新的回退报价不许顶掉 BUFF 行",
+              abs(float(row[0]) - 52.0) < 1e-9 and row[1] == "BUFF", f"{tuple(row)}")
+
+        con.execute(collector.SNAP_UPSERT_QUOTE,
+                    ("Y", "2026-10-13", 40.0, 40.0, 5, None, None, 1000, "C5"))
+        con.commit()
+        con.execute(collector.SNAP_UPSERT_QUOTE,
+                    ("Y", "2026-10-13", 42.0, 42.0, 6, None, None, 2000, "BUFF"))
+        con.commit()
+        row2 = con.execute("SELECT sell, src FROM snap WHERE item_id='Y'").fetchone()
+        check("反过来：BUFF 报价可以升级覆盖回退行",
+              abs(float(row2[0]) - 42.0) < 1e-9 and row2[1] == "BUFF", f"{tuple(row2)}")
+        con.close()
+
+
+def test_log_records_are_formattable() -> None:
+    """[P2] 日志格式串必须能被正常格式化。
+
+    审查在服务器上看到的真实报错：
+        TypeError: not enough arguments for format string
+    原因是警告文案里的「-100%」没有转义 —— logging 用的是惰性 %-格式化，
+    只有在 handler 真正 format(record) 时才会炸；默认处理器把这当成
+    "Logging error" 打到 stderr，于是**代码看起来测试通过、警告却丢了**。
+    所以这里必须真的走一遍 formatter.format()。
+    """
+    print("\n[27] 日志格式串")
+    import logging as _logging  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    captured: list[str] = []
+
+    class _H(_logging.Handler):
+        def emit(self, record):
+            try:
+                captured.append(self.format(record))     # ← 这里才会触发 %-格式化
+            except Exception as e:      # noqa: BLE001
+                captured.append(f"<FORMAT ERROR {type(e).__name__}: {e}>")
+
+    h = _H()
+    h.setFormatter(_logging.Formatter("%(message)s"))
+    lg = _logging.getLogger("collector")
+    lg.addHandler(h)
+    old_level = lg.level
+    lg.setLevel(_logging.WARNING)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            con = collector.connect(Path(td) / "log.db")
+            collector.write_daily_snapshot(con, [
+                {"marketHashName": "BAD",
+                 "dataList": [{"platform": "BUFF", "sellPrice": 0, "sellCount": 3,
+                               "updateTime": 1}]},
+                {"marketHashName": "FB",
+                 "dataList": [{"platform": "C5", "sellPrice": 9.9, "sellCount": 3,
+                               "updateTime": 1}]},
+            ], "2026-10-13")
+            con.close()
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(old_level)
+
+    errs = [c for c in captured if "FORMAT ERROR" in c]
+    check("警告能被正常格式化（含 % 的文案必须转义）", not errs, f"{errs or captured}")
+    check("无效报价的警告确实发出去了",
+          any("无效报价" in c for c in captured), f"{captured}")
+    check("平台回退的警告确实发出去了",
+          any("平台回退" in c for c in captured), f"{captured}")
+
+
+def test_dry_run_never_touches_data_and_freshness_gate() -> None:
+    """[P1] --dry-run 绝不能删数据；[P1] 陈旧行情/未预热的品种不许进截面。"""
+    print("\n[28] dry-run 约定与新鲜度闸门")
+    import tempfile  # noqa: PLC0415
+
+    from pipeline.run_daily import _apply_freshness_gate, abort_no_cross_section  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "dry.db")
+        con.executescript("""
+            CREATE TABLE IF NOT EXISTS factor_latest (item_id TEXT PRIMARY KEY, date TEXT,
+              price REAL, updated_at INTEGER);
+            CREATE TABLE IF NOT EXISTS forecast (item_id TEXT, date TEXT, side TEXT,
+              PRIMARY KEY (item_id, date));
+        """)
+        con.execute("INSERT INTO factor_latest VALUES ('A','2026-10-13',10.0,1)")
+        con.executemany("INSERT INTO forecast VALUES (?,?,?)",
+                        [("A", "2026-10-13", "buy"), ("B", "2026-10-12", "buy")])
+        con.commit()
+
+        abort_no_cross_section(con, "2026-10-13", dry_run=True)
+        fl = con.execute("SELECT COUNT(*) FROM factor_latest").fetchone()[0]
+        fc = con.execute("SELECT COUNT(*) FROM forecast").fetchone()[0]
+        check("--dry-run 不动任何数据（审查发现原本会删掉因子）", fl == 1 and fc == 2,
+              f"factor_latest={fl} forecast={fc}")
+
+        abort_no_cross_section(con, "2026-10-13", dry_run=False)
+        fl2 = con.execute("SELECT COUNT(*) FROM factor_latest").fetchone()[0]
+        fc_today = con.execute("SELECT COUNT(*) FROM forecast WHERE date='2026-10-13'").fetchone()[0]
+        fc_old = con.execute("SELECT COUNT(*) FROM forecast WHERE date='2026-10-12'").fetchone()[0]
+        check("非试跑时因子清空", fl2 == 0, f"{fl2}")
+        check("今天的预测也清掉（否则候选页仍推荐旧 buy）", fc_today == 0, f"{fc_today}")
+        check("历史日期的预测保留（那是另一天的记录）", fc_old == 1, f"{fc_old}")
+        con.close()
+
+    # 新鲜度 / 预热闸门
+    df = pd.DataFrame([
+        {"item_id": "A", "date": pd.Timestamp("2026-10-13"), "is_warm": True},
+        {"item_id": "B", "date": pd.Timestamp("2026-10-03"), "is_warm": True},   # 10 天前
+        {"item_id": "C", "date": pd.Timestamp("2026-10-13"), "is_warm": False},  # 未预热
+    ])
+    out = _apply_freshness_gate(df, CFG)
+    ids = set(out["item_id"])
+    check("陈旧行情被剔除（不许被包装成今天的截面）", "B" not in ids, f"ids={sorted(ids)}")
+    check("未预热的被剔除（特征还没齐）", "C" not in ids, f"ids={sorted(ids)}")
+    check("新行情 + 已预热的保留", ids == {"A"}, f"ids={sorted(ids)}")
 
 
 def main() -> int:
@@ -889,6 +1050,9 @@ def main() -> int:
     test_factor_latest_prune_same_day()
     test_local_push_complete_replacement()
     test_invalid_quotes_rejected_and_src_filtered()
+    test_fallback_never_overwrites_primary_platform()
+    test_log_records_are_formattable()
+    test_dry_run_never_touches_data_and_freshness_gate()
     print("\n" + "=" * 62)
     if FAIL:
         print(f"结果：{len(FAIL)} 项失败 → {FAIL}")

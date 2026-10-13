@@ -53,6 +53,7 @@ CREATE INDEX IF NOT EXISTS ix_snap ON snap(item_id, date);
 -- 抛 no such table: kline，且因为先写 snap 后写 kline，留下半写入状态。
 CREATE TABLE IF NOT EXISTS kline (
   item_id TEXT, date TEXT, o REAL, h REAL, l REAL, c REAL, v INTEGER,
+  ts INTEGER,
   PRIMARY KEY (item_id, date)
 );
 CREATE INDEX IF NOT EXISTS ix_kline ON kline(item_id, date);
@@ -111,14 +112,50 @@ ON CONFLICT(item_id, date) DO UPDATE SET
   src      = COALESCE(excluded.src,      snap.src)
 """
 
-#: snap 专用（快照/挂单量通道）：**必须比较新旧**。
+#: snap 专用（快照/挂单量通道）：**必须比较新旧**，而且**回退数据不许顶掉主平台数据**。
 #:
-#: 踩过的坑：原先两条通道共用无比较的 UPSERT，于是「后写者胜出」——
-#: 一批 5 分钟前抓到的报价，可以把刚写进去的新价盖回旧值。
-#: 而且 batch 原先不写响应里的 updateTime（用的是本机写入时刻），
-#: 连「谁更新」都无从判断。现在 batch 写 updateTime，并且旧的不许覆盖新的。
-SNAP_UPSERT_QUOTE = SNAP_UPSERT.rstrip() + """
-WHERE excluded.ts IS NULL OR snap.ts IS NULL OR excluded.ts >= snap.ts
+#: 两个条件缺一不可：
+#: 1) `excluded.ts >= snap.ts` —— 旧的报价不许覆盖新的。
+#:    踩过的坑：原先两条通道共用无比较的 UPSERT，后写者胜出；而 batch 连
+#:    响应里的 updateTime 都没用（写的是本机时刻），根本无从判断新旧。
+#: 2) 回退平台（C5/YOUPIN/…）不许覆盖 BUFF 行。
+#:    踩过的坑：先有 BUFF ¥52，后来一条更新的悠悠有品 ¥50 把整行改成 YOUPIN，
+#:    而 load_history 会按 src 过滤掉非 BUFF 行 —— 结果原来那条有效的 BUFF ¥52
+#:    也一起没了。升级方向是允许的（BUFF 报价可以覆盖回退行）。
+SNAP_UPSERT_QUOTE = SNAP_UPSERT.rstrip() + f"""
+WHERE (excluded.ts IS NULL OR snap.ts IS NULL OR excluded.ts >= snap.ts)
+  AND (excluded.src = '{PRICE_PLATFORM}' OR snap.src IS NULL OR snap.src <> '{PRICE_PLATFORM}')
+"""
+
+#: kline 表跟 snap 走**同一套**新旧规则 —— 否则图表和页面价格会分裂。
+#: 踩过的坑：snap 那边拒掉了旧的当日 K 线（价格保持 ¥175），
+#: 但 kline 表的 OHLC 仍被无条件覆盖成 ¥173 —— 页面显示 175、图上画 173。
+KLINE_UPSERT = """
+INSERT INTO kline (item_id, date, o, h, l, c, v, ts) VALUES (?,?,?,?,?,?,?,?)
+ON CONFLICT(item_id, date) DO UPDATE SET
+  o=excluded.o, h=excluded.h, l=excluded.l, c=excluded.c,
+  v=COALESCE(excluded.v, kline.v), ts=COALESCE(excluded.ts, kline.ts)
+"""
+
+#: 当日那根还没封口 —— 同样不许被更旧的 bar 覆盖。
+#:
+#: ⚠️ 光在 DO UPDATE 上加 WHERE 是**不够的**：冲突子句只管更新，
+#: 当 kline 里还没有这一行时，INSERT 路径会直接插进去（审查就是靠这个抓到的：
+#: snap 保住了 ¥175，kline 却被插进了 ¥173，页面价格与图表分裂）。
+#: 所以这里用 snap 的 ts 当**唯一的新鲜度参照**再挡一道 INSERT：
+#: 只有当这条 bar 不比 snap 里已有的报价更旧时才写。
+#: 两张表共用同一个参照物，才不会出现"各自判断、各写各的"。
+KLINE_UPSERT_TODAY = """
+INSERT INTO kline (item_id, date, o, h, l, c, v, ts)
+SELECT ?,?,?,?,?,?,?,?
+WHERE NOT EXISTS (
+  SELECT 1 FROM snap
+   WHERE snap.item_id = ? AND snap.date = ? AND COALESCE(snap.ts, 0) > ?
+)
+ON CONFLICT(item_id, date) DO UPDATE SET
+  o=excluded.o, h=excluded.h, l=excluded.l, c=excluded.c,
+  v=COALESCE(excluded.v, kline.v), ts=COALESCE(excluded.ts, kline.ts)
+WHERE excluded.ts IS NULL OR kline.ts IS NULL OR excluded.ts >= kline.ts
 """
 
 
@@ -134,6 +171,12 @@ def _migrate(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE snap ADD COLUMN src TEXT")
         con.commit()
         log.info("snap 补列：src（记录这条行情来自哪个平台 / kline）")
+
+    have_k = {r[1] for r in con.execute("PRAGMA table_info(kline)")}
+    if "ts" not in have_k:
+        con.execute("ALTER TABLE kline ADD COLUMN ts INTEGER")
+        con.commit()
+        log.info("kline 补列：ts（K 线也要能判断新旧，否则图表会被旧 bar 覆盖）")
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -301,11 +344,15 @@ def write_daily_snapshot(
     ⚠️ ts 用响应里的 updateTime（这条报价自己的时间），不是本机写入时刻。
     否则「旧报价不许覆盖新报价」这条约束根本无从判断（见 SNAP_UPSERT_QUOTE）。
 
-    ⚠️ 报价必须过 _valid_price：0 / 负数 / NaN 一律丢弃并计数，
-    绝不能让它变成价格序列里的一根「−100% 暴跌」。
+    ⚠️ 报价必须过 _valid_price：0 / 负数 / NaN 一律不写进价格。
+    但不能因此**丢掉整条响应**（踩过的坑）：没有在售价时 sellCount 往往正好是 0，
+    而「挂单量已知为 0」是要喂给流动性闸门的有效信息 —— 一起丢掉的话，
+    闸门会把它当成「不知道」而放行，等于放行了一个没人挂售的品种。
+    所以无效价格写成 NULL（load_history 会 dropna 掉，不进模型），
+    但挂单量/求购量照常记录；ts 也传 NULL —— 不拿一条没有价格的报价去宣称"更新"。
     """
     n = 0
-    skipped = 0
+    bad_price = 0
     fallback: dict[str, int] = {}
     now_ts = int(time.time())
     for blk in blocks:
@@ -313,9 +360,9 @@ def write_daily_snapshot(
         row = pick_platform(blk, prefer)
         if not name or not row:
             continue
-        if not _valid_price(row.get("sellPrice")):
-            skipped += 1
-            continue
+        price_ok = _valid_price(row.get("sellPrice"))
+        if not price_ok:
+            bad_price += 1
         bid = row.get("biddingPrice")
         plat = str(row.get("platform") or "?")
         if plat != prefer:
@@ -325,20 +372,22 @@ def write_daily_snapshot(
             (
                 name,
                 date,
-                float(row["sellPrice"]),
+                float(row["sellPrice"]) if price_ok else None,
                 float(bid) if _valid_price(bid) else None,
                 _valid_count(row.get("sellCount")),
                 None,       # 成交量由 Steam 侧补充
                 None,       # 存世量需另接数据源
-                int(row.get("updateTime") or now_ts),
+                # 价格无效时不写 ts：否则一条"没有价格的报价"会顶掉已有行的时间戳，
+                # 反而把随后到达的有效报价（时间戳更旧）挡在门外
+                int(row.get("updateTime") or now_ts) if price_ok else None,
                 plat,
             ),
         )
         n += 1
     con.commit()
-    if skipped:
-        log.warning("丢弃 %d 条无效报价（sellPrice 非正 / 非有限）—— 静默写入会让它们"
-                    "在特征里变成 −100% 暴跌", skipped)
+    if bad_price:
+        log.warning("丢弃 %d 条无效报价的**价格**（sellPrice 非正 / 非有限，已置空），"
+                    "但保留其挂单量 —— 静默写入会让它在特征里变成 -100%% 暴跌", bad_price)
     if fallback:
         log.warning("平台回退 %d 个品种（%s 缺失）：%s —— "
                     "这些行的 src 不是 %s，混口径会在价格序列里制造人工跳价；"
@@ -627,18 +676,20 @@ def write_kline_rows(
             bad += 1
             continue
         day = datetime.fromtimestamp(ts + 8 * 3600, tz=timezone.utc).strftime("%Y-%m-%d")
-        upsert = SNAP_UPSERT if day < today else SNAP_UPSERT_QUOTE
-        # 关键：K 线只提供价格，用 UPSERT 保证它不会把 batch 采集补上的
-        # bid / listings 清成 NULL（原先的 INSERT OR REPLACE 会）
-        con.execute(upsert, (item_id, day, c, None, None, None, None, ts, src))
+        # 当日（含未来）那一根还没封口：snap 与 kline 都必须受新旧保护，
+        # 两张表一起拒或一起收，否则页面价格和图表会对不上。
+        today_bar = day >= today
+        con.execute(
+            SNAP_UPSERT_QUOTE if today_bar else SNAP_UPSERT,
+            (item_id, day, c, None, None, None, None, ts, src),
+        )
         if write_kline:
-            con.execute(
-                "INSERT INTO kline (item_id, date, o, h, l, c, v) VALUES (?,?,?,?,?,?,?) "
-                "ON CONFLICT(item_id, date) DO UPDATE SET "
-                "o=excluded.o, h=excluded.h, l=excluded.l, c=excluded.c, "
-                "v=COALESCE(excluded.v, kline.v)",
-                (item_id, day, o, h, l, c, None),
-            )
+            if today_bar:
+                # 参数：SELECT 的 8 个 + 守卫子查询的 3 个（item_id / date / ts）
+                con.execute(KLINE_UPSERT_TODAY,
+                            (item_id, day, o, h, l, c, None, ts, item_id, day, ts))
+            else:
+                con.execute(KLINE_UPSERT, (item_id, day, o, h, l, c, None, ts))
         n += 1
     if bad:
         log.warning("%s：丢弃 %d 条不合格 K 线（非有限值 / 非正数 / OHLC 自相矛盾）",
