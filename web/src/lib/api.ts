@@ -150,7 +150,13 @@ export interface ItemDetail {
     image: string | null;
   } | null;
   factor: FactorRow | null;
-  forecast: (Candidate & { horizon?: number; model_version?: string }) | null;
+  forecast: (Candidate & {
+    horizon?: number;
+    model_version?: string;
+    /** true = 最近一次运行没有产生有效截面，这条只是历史预测，不代表当前建议 */
+    stale?: boolean;
+    staleReason?: string | null;
+  }) | null;
   caseMeta: CaseRow | null;
   alerts: { level: string; score: number; ts: number; detail: string }[];
 }

@@ -312,6 +312,22 @@ def item_detail(item_id: str) -> dict[str, Any]:
         forecast = con.execute(
             "SELECT * FROM forecast WHERE item_id = ? ORDER BY date DESC LIMIT 1", (item_id,)
         ).fetchone()
+        # 「最近一次运行没有产生有效截面」时，这条历史预测属于**旧建议**，
+        # 不能当成当前结论展示（审查发现：候选列表已经返回空，
+        # 但单品详情页仍然照旧返回昨天的 side=buy）。
+        # 历史记录保留，只是明确标注为历史。
+        try:
+            meta = {r["k"]: r["v"] for r in con.execute("SELECT k, v FROM meta")}
+        except sqlite3.Error:
+            meta = {}
+        marker = meta.get("no_cross_section_on") or ""
+        fc_dict = dict(forecast) if forecast else None
+        if fc_dict is not None:
+            last_run = meta.get("last_run") or ""
+            fc_dict["stale"] = bool(marker and marker == last_run
+                                    and str(fc_dict.get("date")) < last_run)
+            fc_dict["staleReason"] = ("最近一次运行没有产生有效截面，这条是历史预测"
+                                      if fc_dict["stale"] else None)
         kase = con.execute(
             """SELECT cm.* FROM case_meta cm JOIN items i ON i.case_id = cm.case_id
                 WHERE i.item_id = ?""",
@@ -324,7 +340,7 @@ def item_detail(item_id: str) -> dict[str, Any]:
         return ok({
             "item": dict(item),
             "factor": dict(factor) if factor else None,
-            "forecast": dict(forecast) if forecast else None,
+            "forecast": fc_dict,
             "caseMeta": dict(kase) if kase else None,
             "alerts": rows_to_list(alerts),
         })

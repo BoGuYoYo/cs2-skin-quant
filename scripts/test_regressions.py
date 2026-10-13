@@ -1175,6 +1175,127 @@ def test_no_cross_section_contract() -> None:
           "no_cross_section_on" in api and "最近一次运行没有产生有效截面" in api)
 
 
+def test_observation_date_not_ingest_date() -> None:
+    """[P1] 新鲜度必须看「这条行情自己的时间」，不是「入库那天」。
+
+    审查给的场景：2026-10-13 抓到一条来源 updateTime = 2026-09-29 的缓存报价。
+    写入时 date 是采集那天（今天），于是只看 date 的闸门会把它当成今天的行情。
+    """
+    print("\n[33] 观测时间 vs 入库日期")
+    import tempfile  # noqa: PLC0415
+    from datetime import datetime as _dt  # noqa: PLC0415
+    from datetime import timedelta as _td  # noqa: PLC0415
+
+    from pipeline.config import BEIJING as _BJ  # noqa: PLC0415
+    from pipeline.run_daily import _apply_freshness_gate  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "obs.db")
+        now = _dt.now(_BJ)
+        today = now.strftime("%Y-%m-%d")
+        stale_ts = int((now - _td(days=30)).timestamp())     # 缓存行情：观测时间是 30 天前
+        fresh_ts = int((now - _td(days=1)).timestamp())
+        con.execute(collector.SNAP_UPSERT_QUOTE,
+                    ("STALE", today, 50.0, 50.0, 30, None, None, stale_ts, "BUFF", stale_ts))
+        con.execute(collector.SNAP_UPSERT_QUOTE,
+                    ("FRESH", today, 60.0, 60.0, 30, None, None, fresh_ts, "BUFF", fresh_ts))
+        con.commit()
+
+        hist = collector.load_history(con, days=120)
+        obs = dict(zip(hist["item_id"], hist["obs_date"].dt.strftime("%Y-%m-%d")))
+        check("load_history 还原出观测日期（区别于入库日期）",
+              obs.get("STALE") is not None and obs.get("STALE") != today, f"{obs}")
+        kept = set(_apply_freshness_gate(hist, CFG, today)["item_id"])
+        check("缓存行情被新鲜度闸门剔除", "STALE" not in kept, f"kept={kept}")
+        check("正常行情保留", "FRESH" in kept, f"kept={kept}")
+
+        lst = collector.latest_listings(con, ["STALE"])
+        check("挂单量的观测日期也不是入库日期",
+              str(lst.iloc[0]["listings_obs_date"])[:10] != today, f"{dict(lst.iloc[0])}")
+        con.close()
+
+
+def test_count_ts_requires_an_actual_count() -> None:
+    """[P2] 响应里没有挂单量时，不许推进 count_ts。
+
+    审查给的序列：80/1000 → 数量缺失/3000 → 0/2000。
+    中间那次空观测若推进了时间戳，最后那条有效数量就永远进不来（被锁死）。
+    """
+    print("\n[34] 空数量观测不许推进时间戳")
+    import tempfile  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "cts2.db")
+        con.execute(collector.SNAP_UPSERT_QUOTE,
+                    ("X", "2026-10-13", 11.0, 11.0, 80, None, None, 1000, "BUFF", 1000))
+        con.commit()
+        con.execute(collector.SNAP_UPSERT_QUOTE,      # 数量缺失但时间戳更晚
+                    ("X", "2026-10-13", 11.0, 11.0, None, None, None, 1000, "BUFF", 3000))
+        con.commit()
+        row = con.execute("SELECT listings, count_ts FROM snap WHERE item_id='X'").fetchone()
+        check("空观测不推进 count_ts", row[1] == 1000, f"count_ts={row[1]}")
+        check("数量保持 80", row[0] == 80, f"listings={row[0]}")
+        con.execute(collector.SNAP_UPSERT_QUOTE,      # 时间戳较旧但有效的数量观测
+                    ("X", "2026-10-13", 11.0, 11.0, 0, None, None, 1000, "BUFF", 2000))
+        con.commit()
+        row2 = con.execute("SELECT listings, count_ts FROM snap WHERE item_id='X'").fetchone()
+        check("有效数量观测能覆盖（0 是合法值）",
+              row2[0] == 0 and row2[1] == 2000, f"{tuple(row2)}")
+
+        collector.write_daily_snapshot(con, [
+            {"marketHashName": "NOCNT",
+             "dataList": [{"platform": "BUFF", "sellPrice": 9.9, "updateTime": 5000}]},
+        ], "2026-10-13")
+        got = con.execute("SELECT listings, count_ts FROM snap WHERE item_id='NOCNT'").fetchone()
+        check("响应没有挂单量时 count_ts 记 NULL（不宣称观测过）",
+              got[0] is None and got[1] is None, f"{tuple(got)}")
+        con.close()
+
+
+def test_expired_listings_not_reused_by_anomaly() -> None:
+    """[P2] 过期挂单量在异动检测里也必须算「不知道」。
+
+    审查给的矛盾：前置闸门（放行）与 decide.detect_anomaly（按原值拦下）对同一份
+    过期数据给出两种解释 —— 一条本该报 L3 的暴跌被「挂单少」静默压掉。
+    """
+    print("\n[35] 过期挂单量不得压掉告警")
+    from pipeline.run_daily import _apply_liquidity_gate  # noqa: PLC0415
+
+    df = pd.DataFrame([{"item_id": "A", "listings": 0,
+                        "listings_obs_date": pd.Timestamp("2026-09-01")}])
+    out = _apply_liquidity_gate(df, CFG, "2026-10-13")
+    check("过期挂单量落成缺失（不是留在行里当 0）",
+          bool(pd.isna(out.loc[0, "listings"])), f"{out.loc[0, 'listings']}")
+
+    crash = {"ret_21d": -0.5, "ret_7d": -0.2, "vol_z": -6.0,
+             "listings": out.loc[0, "listings"], "volume": None}
+    lv, score, why = decide.detect_anomaly(crash, CFG)
+    check("过期挂单量不再让暴跌告警被静默压掉", lv == "L3", f"level={lv} why={why}")
+
+    fresh = dict(crash)
+    fresh["listings"] = 0
+    lv2, _, why2 = decide.detect_anomaly(fresh, CFG)
+    check("新鲜的零挂单量仍然拦截（闸门本意不变）", lv2 is None and "挂单少" in why2,
+          f"level={lv2} why={why2}")
+
+
+def test_stale_forecast_marked_on_detail_page() -> None:
+    """[P2] 无截面时，单品详情页不许再把旧预测当当前建议。"""
+    print("\n[36] 详情页的历史预测必须标注")
+    api_src = (SERVER / "app.py").read_text(encoding="utf-8")
+    check("后端给历史预测打 stale 标记",
+          'fc_dict["stale"]' in api_src and "no_cross_section_on" in api_src)
+    check("stale 判定要求「预测日期早于最近一次运行」",
+          'str(fc_dict.get("date")) < last_run' in api_src)
+
+    web = SERVER.parent / "web" / "src"
+    ts = (web / "lib" / "api.ts").read_text(encoding="utf-8")
+    check("前端类型里有 stale 字段", "stale?: boolean" in ts)
+    page = (web / "pages" / "ItemDetail.tsx").read_text(encoding="utf-8")
+    check("详情页对 stale 预测显示提示而不是买入标签",
+          "fc?.stale" in page and "非当前建议" in page)
+
+
 def main() -> int:
     print("=" * 62)
     print("回归测试：每条对应一个真实踩过的坑")
@@ -1211,6 +1332,10 @@ def main() -> int:
     test_count_freshness_is_independent()
     test_liquidity_snapshot_overrides_stale_price_row()
     test_no_cross_section_contract()
+    test_observation_date_not_ingest_date()
+    test_count_ts_requires_an_actual_count()
+    test_expired_listings_not_reused_by_anomaly()
+    test_stale_forecast_marked_on_detail_page()
     print("\n" + "=" * 62)
     if FAIL:
         print(f"结果：{len(FAIL)} 项失败 → {FAIL}")

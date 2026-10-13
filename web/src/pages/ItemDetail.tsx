@@ -83,7 +83,13 @@ export default function ItemDetail() {
             </div>
             <div className="ark-pageActions" style={{ marginTop: 8 }}>
               {it?.case_name ? <span className="tag t-mute">{it.case_name}</span> : null}
-              <span className={`tag t-${side.tone}`}>{side.text}</span>
+              {fc?.stale ? (
+                // 「最近一次运行没有产生有效截面」时，这条是历史预测 ——
+                // 不能把 side=buy 当成当前建议挂在这里（后端已标注 stale）
+                <span className="tag t-warn">历史预测 · 非当前建议</span>
+              ) : (
+                <span className={`tag t-${side.tone}`}>{side.text}</span>
+              )}
               <span className={`tag t-${fit.tone}`}>下跌 {f?.drop_duration_days ?? '—'} 天 · {fit.text}</span>
             </div>
           </div>
@@ -104,6 +110,11 @@ export default function ItemDetail() {
         <div className="ark-panel">
           <h3>预测区间（未来 21 日，扣费后对数净收益）</h3>
           <State loading={detail.loading} error={detail.error}>
+            {fc?.stale ? (
+              <div className="t-warn" style={{ fontSize: 12, marginBottom: 8 }}>
+                ⚠️ {fc.staleReason ?? '这是历史预测'}（数据日 {fc.date}）。下面的数值不是当前建议。
+              </div>
+            ) : null}
             <QuantileBand q10={fc?.q10_adj ?? null} q50={fc?.q50 ?? null} q90={fc?.q90_adj ?? null} />
             <div className="grid g3" style={{ marginTop: 14 }}>
               <div>

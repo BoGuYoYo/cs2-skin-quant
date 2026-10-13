@@ -133,12 +133,17 @@ _PRICE_WRITE_COND = (
 #: 踩过的坑：价格无效时把 ts 置空，而 UPSERT 又允许 NULL 时间戳无条件更新 ——
 #: 一条更旧的「零挂单量」就把刚刚写进去的 80 改成了 0，而价格时间戳还显示是新的。
 #:
+#: ⚠️ 还要求**这次真的带回了数量**（excluded.listings IS NOT NULL）：
+#: 否则一次「响应里没有 sellCount」的空观测也会把 count_ts 推到最新，
+#: 随后那条时间戳更旧的有效数量就永远进不来了（数量被 80 + 新时间戳锁死）。
+#:
 #: 这里**不**按平台过滤数量（试过，不行）：没有在售价时 src 本来就是空的，
 #: 一卡平台条件就等于「今天没人挂售」这条最有用的流动性信息也写不进来。
 #: 口径纪律对**价格**最重要（混平台会凭空跳出一根假 K 线），
 #: 而挂单量只用来做「<20 就不看」这种粗粒度流动性闸门，平台差异是次要的。
 _COUNT_WRITE_COND = (
     "excluded.count_ts IS NOT NULL"
+    " AND excluded.listings IS NOT NULL"
     " AND (snap.count_ts IS NULL OR excluded.count_ts >= snap.count_ts)"
 )
 
@@ -401,6 +406,7 @@ def write_daily_snapshot(
         if plat != prefer:
             fallback[plat] = fallback.get(plat, 0) + 1
         quote_ts = int(row.get("updateTime") or now_ts)
+        cnt = _valid_count(row.get("sellCount"))
         con.execute(
             SNAP_UPSERT_QUOTE,   # 不是 INSERT OR REPLACE，也不是无比较的 UPSERT
             (
@@ -408,16 +414,17 @@ def write_daily_snapshot(
                 date,
                 float(row["sellPrice"]) if price_ok else None,
                 float(bid) if _valid_price(bid) else None,
-                _valid_count(row.get("sellCount")),
+                cnt,
                 None,       # 成交量由 Steam 侧补充
                 None,       # 存世量需另接数据源
                 # 价格与数量是两次独立的观测：
                 #   ts       —— 价格的观测时间，价格无效就置空（不许它顶掉已有价格的时间戳，
                 #                也不许它把 src 改成 BUFF 而价格其实是别的平台的）
-                #   count_ts —— 挂单量自己的观测时间，无论价格是否有效都要如实写
+                #   count_ts —— 挂单量自己的观测时间；**响应里没有挂单量就不给时间戳**，
+                #                否则空观测会把后续更旧（但有效）的数量锁在门外
                 quote_ts if price_ok else None,
                 plat if price_ok else None,
-                quote_ts,
+                quote_ts if cnt is not None else None,
             ),
         )
         n += 1
@@ -859,6 +866,7 @@ def load_history(
 
     df = pd.read_sql_query(
         """SELECT s.item_id, s.date, s.sell AS price, s.bid, s.listings, s.volume, s.supply,
+                  s.ts AS obs_ts,
                   i.case_id AS case_id, i.case_name AS case_name
              FROM snap s
              LEFT JOIN items i ON i.item_id = s.item_id""" + where,
@@ -871,6 +879,23 @@ def load_history(
     for c in ("price", "bid", "listings", "volume", "supply"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # ---------------------------------------------------------- 观测日期
+    # 「入库日期（date）」≠「这条行情真正发生的时间」。
+    # 踩过的坑（审查）：date 是**采集那天**写的，于是 2026-10-13 抓到一条
+    # 来源 updateTime = 2026-09-29 的缓存报价时，新鲜度闸门只看 date，
+    # 就把一个月前的行情当成今天的放行了。
+    #
+    # ts 是这条行情自己的时间戳：
+    #   batch 报价 → 平台返回的 updateTime
+    #   K 线       → 那根 bar 的戳（历史 bar 是 UTC 16:00 = 北京次日 00:00，
+    #                当前 bar 是最后一次更新时间）
+    # 两者都按同一套约定（+8h）换成北京日期，正好等于 K 线入库时用的口径。
+    # ts 为空（没有价格、或早期数据）时退回 date。
+    ts_num = pd.to_numeric(df.pop("obs_ts"), errors="coerce")
+    obs = pd.to_datetime(ts_num, unit="s", errors="coerce", utc=True) + pd.Timedelta(hours=8)
+    df["obs_date"] = obs.dt.tz_localize(None).dt.normalize()
+    df["obs_date"] = df["obs_date"].fillna(pd.to_datetime(df["date"]))
 
     df = df.dropna(subset=["price"])
     # 读到 0 / 负价时直接当无效（写入端已校验，这里是防历史脏数据的安全网 ——
@@ -920,6 +945,11 @@ def latest_listings(con: sqlite3.Connection, items: list[str] | None = None) -> 
     for c in ("listings", "count_ts"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+    # 观测日期同样按 count_ts 还原（同 load_history 的理由：
+    # 入库日期是采集那天，不能代表这条挂单量是什么时候看到的）
+    obs = pd.to_datetime(df["count_ts"], unit="s", errors="coerce", utc=True) + pd.Timedelta(hours=8)
+    df["listings_obs_date"] = obs.dt.tz_localize(None).dt.normalize()
+    df["listings_obs_date"] = df["listings_obs_date"].fillna(pd.to_datetime(df["listings_date"]))
     return df
 
 

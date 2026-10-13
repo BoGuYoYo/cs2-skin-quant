@@ -201,14 +201,23 @@ def _apply_liquidity_gate(latest: pd.DataFrame, cfg: Cfg, day: str | None = None
         return latest
 
     known = latest["listings"].notna()
-    if day is not None and "listings_date" in latest.columns:
-        ld = pd.to_datetime(latest["listings_date"], errors="coerce")
-        age = (pd.Timestamp(day) - ld).dt.days
-        expired = known & ~age.between(0, cfg.infer_max_age_days)
-        if bool(expired.any()):
-            log.info("流动性闸门：%d 个品种的挂单量快照已过期（超 %d 天），按「不知道」放行",
-                     int(expired.sum()), cfg.infer_max_age_days)
-        known = known & ~expired
+    if day is not None:
+        # 用「观测日期」而不是入库日期（同上：缓存行情不能被入库日洗白）
+        dcol = ("listings_obs_date" if "listings_obs_date" in latest.columns
+                else "listings_date" if "listings_date" in latest.columns else None)
+        if dcol:
+            ld = pd.to_datetime(latest[dcol], errors="coerce")
+            age = (pd.Timestamp(day) - ld).dt.days
+            expired = known & ~age.between(0, cfg.infer_max_age_days)
+            if bool(expired.any()):
+                log.info("流动性闸门：%d 个品种的挂单量快照已过期（超 %d 天），按「不知道」放行",
+                         int(expired.sum()), cfg.infer_max_age_days)
+                # ⚠️ 把「过期」落成**数据里的缺失**，而不是只在本地掩码里忽略 ——
+                # 否则 decide.detect_anomaly 后面还会拿这个过期值去卡流动性闸门，
+                # 出现「前置闸门放行、告警却以'挂单少'被压掉」的不一致（审查发现）。
+                latest = latest.copy()
+                latest.loc[expired, "listings"] = np.nan
+            known = known & ~expired
 
     if not bool(known.any()):
         log.warning("流动性闸门未生效：没有可用的挂单量快照"
@@ -286,8 +295,13 @@ def _apply_freshness_gate(latest: pd.DataFrame, cfg: Cfg, day: str) -> pd.DataFr
     n0 = len(latest)
     ref = pd.Timestamp(day)
 
-    if "date" in latest.columns:
-        d = pd.to_datetime(latest["date"], errors="coerce")
+    # 优先用「观测日期」而不是「入库日期」（审查发现）：
+    # date 是**采集那天**写进去的，于是一条 09-29 的缓存报价在今天被抓到时
+    # 也会被标成今天的行情。obs_date = 这条行情自己的时间戳（batch 的 updateTime /
+    # K 线 bar 的戳）换算成北京日期；没有时间戳时退回 date。
+    dcol = "obs_date" if "obs_date" in latest.columns else "date"
+    if dcol in latest.columns:
+        d = pd.to_datetime(latest[dcol], errors="coerce")
         age = (ref - d).dt.days
         fresh = age.between(0, cfg.infer_max_age_days)      # 负数 = 未来日期，一并拒掉
         n_future = int((age < 0).sum())
