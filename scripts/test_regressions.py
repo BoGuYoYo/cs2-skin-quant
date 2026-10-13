@@ -561,7 +561,7 @@ def test_listings_cross_midnight_and_stale_guard() -> None:
 
         def put(day: str, price: float, ts: int, plat: str = "BUFF") -> None:
             con.execute(collector.SNAP_UPSERT_QUOTE,
-                        ("X", day, price, price, 10, None, None, ts, plat))
+                        ("X", day, price, price, 10, None, None, ts, plat, ts))
             con.commit()
 
         put("2026-10-12", 100.0, 2_000_000)
@@ -718,7 +718,8 @@ def test_kline_today_is_guarded_history_is_not() -> None:
         # ① 当日：先写一条「更新的报价」，再来一根更旧的当日 K 线
         quote_ts = ts_today + 3600 * 6          # 今天 06:00 北京（比 bar 戳更新）
         con.execute(collector.SNAP_UPSERT_QUOTE,
-                    ("T", now.strftime("%Y-%m-%d"), 175.0, 175.0, 30, None, None, quote_ts, "BUFF"))
+                    ("T", now.strftime("%Y-%m-%d"), 175.0, 175.0, 30, None, None, quote_ts, "BUFF",
+                     quote_ts))
         con.commit()
         collector.write_kline_rows(con, "T", [[ts_today, 174.0, 173.0, 176.0, 172.0]])
         got = con.execute("SELECT sell FROM snap WHERE item_id='T'").fetchone()[0]
@@ -727,7 +728,8 @@ def test_kline_today_is_guarded_history_is_not() -> None:
         # ② 历史：报价是昨天盘中写的（ts 更新），今天补的日线是权威定稿 → 应覆盖
         yday = (now + _td(days=-1)).strftime("%Y-%m-%d")
         con.execute(collector.SNAP_UPSERT_QUOTE,
-                    ("H", yday, 200.0, 200.0, 30, None, None, ts_yday + 3600 * 10, "BUFF"))
+                    ("H", yday, 200.0, 200.0, 30, None, None, ts_yday + 3600 * 10, "BUFF",
+                     ts_yday + 3600 * 10))
         con.commit()
         collector.write_kline_rows(con, "H", [[ts_yday, 190.0, 188.0, 191.0, 187.0]])
         got2 = con.execute("SELECT sell FROM snap WHERE item_id='H'").fetchone()[0]
@@ -899,24 +901,77 @@ def test_fallback_never_overwrites_primary_platform() -> None:
         con = collector.connect(Path(td) / "fb.db")
 
         con.execute(collector.SNAP_UPSERT_QUOTE,
-                    ("X", "2026-10-13", 52.0, 52.0, 10, None, None, 1000, "BUFF"))
+                    ("X", "2026-10-13", 52.0, 52.0, 10, None, None, 1000, "BUFF", 1000))
         con.commit()
         con.execute(collector.SNAP_UPSERT_QUOTE,      # 更新，但来源是回退平台
-                    ("X", "2026-10-13", 50.0, 50.0, 12, None, None, 2000, "YOUPIN"))
+                    ("X", "2026-10-13", 50.0, 50.0, 12, None, None, 2000, "YOUPIN", 2000))
         con.commit()
         row = con.execute("SELECT sell, src FROM snap WHERE item_id='X'").fetchone()
         check("更新的回退报价不许顶掉 BUFF 行",
               abs(float(row[0]) - 52.0) < 1e-9 and row[1] == "BUFF", f"{tuple(row)}")
 
         con.execute(collector.SNAP_UPSERT_QUOTE,
-                    ("Y", "2026-10-13", 40.0, 40.0, 5, None, None, 1000, "C5"))
+                    ("Y", "2026-10-13", 40.0, 40.0, 5, None, None, 1000, "C5", 1000))
         con.commit()
         con.execute(collector.SNAP_UPSERT_QUOTE,
-                    ("Y", "2026-10-13", 42.0, 42.0, 6, None, None, 2000, "BUFF"))
+                    ("Y", "2026-10-13", 42.0, 42.0, 6, None, None, 2000, "BUFF", 2000))
         con.commit()
         row2 = con.execute("SELECT sell, src FROM snap WHERE item_id='Y'").fetchone()
         check("反过来：BUFF 报价可以升级覆盖回退行",
               abs(float(row2[0]) - 42.0) < 1e-9 and row2[1] == "BUFF", f"{tuple(row2)}")
+        con.close()
+
+
+def test_invalid_quote_does_not_relabel_source() -> None:
+    """[P1] 无效报价不许把别的平台的价格"改标签"成 BUFF。
+
+    审查给的场景：库里本来是 C5 ¥50，随后收到一条 BUFF 的**零报价** ——
+    价格被 COALESCE 保住了，src 却照改不误，于是那条 C5 价被贴上 BUFF 标签，
+    顺利通过 src 过滤进了训练历史。来源必须描述"当前这条价格到底是谁的"。
+    """
+    print("\n[29] 无效报价不许改来源标签")
+    import tempfile  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "relabel.db")
+        con.execute(collector.SNAP_UPSERT_QUOTE,
+                    ("X", "2026-10-13", 50.0, 50.0, 7, None, None, 1000, "C5", 1000))
+        con.commit()
+        con.execute(collector.SNAP_UPSERT_QUOTE,      # 更新的 BUFF 零报价
+                    ("X", "2026-10-13", None, None, 9, None, None, None, None, 2000))
+        con.commit()
+        row = con.execute("SELECT sell, src, listings FROM snap WHERE item_id='X'").fetchone()
+        check("价格与来源都保持是 C5 的",
+              abs(float(row[0]) - 50.0) < 1e-9 and row[1] == "C5", f"{tuple(row)}")
+        check("挂单量仍按自己的时间戳更新", row[2] == 9, f"listings={row[2]}")
+        hist = collector.load_history(con, days=30)
+        check("该行仍被 src 过滤挡住，进不了模型历史", hist.empty, f"rows={len(hist)}")
+        con.close()
+
+
+def test_count_freshness_is_independent() -> None:
+    """[P2] 更旧的无效报价不许把更新的挂单量改掉。
+
+    价格与数量是两次独立观测：价格无效时 ts 为空，而 UPSERT 若因此无条件更新，
+    一条更旧的「零挂单量」就会把刚写进去的 80 改成 0，且价格时间戳还显示是新的。
+    """
+    print("\n[30] 挂单量有独立的新旧判断")
+    import tempfile  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "cts.db")
+        con.execute(collector.SNAP_UPSERT_QUOTE,      # 较新的挂单量观测
+                    ("X", "2026-10-13", 11.0, 11.0, 80, None, None, 2000, "BUFF", 2000))
+        con.commit()
+        con.execute(collector.SNAP_UPSERT_QUOTE,      # 更旧、价格无效、挂单量 0 → 不许覆盖
+                    ("X", "2026-10-13", None, None, 0, None, None, None, None, 1000))
+        con.commit()
+        row = con.execute(
+            "SELECT sell, listings, ts, count_ts FROM snap WHERE item_id='X'").fetchone()
+        check("更旧的零挂单量不许覆盖更新的 80", row[1] == 80, f"listings={row[1]}")
+        check("价格及其时间戳不受影响",
+              abs(float(row[0]) - 11.0) < 1e-9 and row[2] == 2000, f"{tuple(row)}")
+        check("挂单量时间戳保持较新值", row[3] == 2000, f"count_ts={row[3]}")
         con.close()
 
 
@@ -1008,17 +1063,116 @@ def test_dry_run_never_touches_data_and_freshness_gate() -> None:
         check("历史日期的预测保留（那是另一天的记录）", fc_old == 1, f"{fc_old}")
         con.close()
 
-    # 新鲜度 / 预热闸门
+    # 新鲜度 / 预热闸门（#2：基准日必须是"运行当天"，不是截面里的 max(date)）
     df = pd.DataFrame([
         {"item_id": "A", "date": pd.Timestamp("2026-10-13"), "is_warm": True},
         {"item_id": "B", "date": pd.Timestamp("2026-10-03"), "is_warm": True},   # 10 天前
         {"item_id": "C", "date": pd.Timestamp("2026-10-13"), "is_warm": False},  # 未预热
+        {"item_id": "D", "date": pd.Timestamp("2026-10-20"), "is_warm": True},   # 未来日期
     ])
-    out = _apply_freshness_gate(df, CFG)
+    out = _apply_freshness_gate(df, CFG, "2026-10-13")
     ids = set(out["item_id"])
     check("陈旧行情被剔除（不许被包装成今天的截面）", "B" not in ids, f"ids={sorted(ids)}")
     check("未预热的被剔除（特征还没齐）", "C" not in ids, f"ids={sorted(ids)}")
+    check("异常的未来日期被剔除", "D" not in ids, f"ids={sorted(ids)}")
     check("新行情 + 已预热的保留", ids == {"A"}, f"ids={sorted(ids)}")
+
+    # 全池停更：所有人日期一样旧 —— 用 max(date) 当参照会全部放行（审查抓到的）
+    stale = pd.DataFrame([
+        {"item_id": "X", "date": pd.Timestamp("2026-09-29"), "is_warm": True},
+        {"item_id": "Y", "date": pd.Timestamp("2026-09-29"), "is_warm": True},
+    ])
+    out2 = _apply_freshness_gate(stale, CFG, "2026-10-13")
+    check("全池停更时仍然全部剔除（参照日不能取截面最大值）", out2.empty, f"rows={len(out2)}")
+
+
+def test_liquidity_snapshot_overrides_stale_price_row() -> None:
+    """[P2] 今天的「零挂单量」必须能盖过昨天的挂单量。
+
+    审查给的端到端场景：今天 sell=NULL / listings=0，而 load_history 只保留
+    有价格的行 → 截面拿到的是**昨天的价格 + 昨天的 listings(100)** → 闸门放行。
+    价格取"最后一根有效价"、流动性取"最新一次快照"，两者按品种关联才不会这样。
+    """
+    print("\n[31] 流动性快照独立于价格行")
+    import tempfile  # noqa: PLC0415
+
+    from pipeline.run_daily import _apply_liquidity_gate  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "liq.db")
+        today, yday = "2026-10-13", "2026-10-12"
+        # A：昨天有价有量；今天没在售价（价格 NULL）、挂单量 0
+        con.execute(collector.SNAP_UPSERT_QUOTE,
+                    ("A", yday, 11.0, 11.0, 100, None, None, 1000, "BUFF", 1000))
+        con.execute(collector.SNAP_UPSERT_QUOTE,
+                    ("A", today, None, None, 0, None, None, None, None, 2000))
+        # B：今天价量正常
+        con.execute(collector.SNAP_UPSERT_QUOTE,
+                    ("B", today, 12.0, 12.0, 500, None, None, 2000, "BUFF", 2000))
+        con.commit()
+
+        cross = collector.load_history(con, days=30)
+        check("价格口径：A 只有昨天那行（今天没有有效价格）",
+              set(cross[cross["item_id"] == "A"]["date"].dt.strftime("%Y-%m-%d")) == {yday},
+              f"{cross[cross['item_id'] == 'A']['date'].tolist()}")
+
+        lst = collector.latest_listings(con, ["A", "B"])
+        a_row = lst[lst["item_id"] == "A"].iloc[0]
+        check("流动性口径：A 取到今天那次快照（listings=0）",
+              int(a_row["listings"]) == 0 and str(a_row["listings_date"]) == today,
+              f"{dict(a_row)}")
+
+        merged = cross.drop(columns=["listings"], errors="ignore").merge(
+            lst[["item_id", "listings", "listings_date"]], on="item_id", how="left")
+        out = _apply_liquidity_gate(merged, CFG, today)
+        kept = set(out["item_id"])
+        check("今天零挂单量的 A 被剔除（不再用昨天的 100 放行）", "A" not in kept, f"kept={kept}")
+        check("挂单量充足的 B 保留", "B" in kept, f"kept={kept}")
+
+        # 反过来：快照太旧就按「不知道」放行，而不是拿它当今天的流动性
+        merged2 = merged.copy()
+        merged2["listings_date"] = pd.Timestamp("2026-09-01")
+        out2 = _apply_liquidity_gate(merged2, CFG, today)
+        check("挂单量快照过期时按「不知道」放行（不误杀）",
+              set(out2["item_id"]) == {"A", "B"}, f"kept={set(out2['item_id'])}")
+        con.close()
+
+
+def test_no_cross_section_contract() -> None:
+    """[P2] 无截面时的收尾必须一致，且接口不许退回昨天的建议。"""
+    print("\n[32] 无截面：统一收尾与接口契约")
+    import tempfile  # noqa: PLC0415
+
+    from pipeline.run_daily import abort_no_cross_section  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "nx.db")
+        con.executescript("""
+            CREATE TABLE IF NOT EXISTS factor_latest (item_id TEXT PRIMARY KEY, date TEXT,
+              price REAL, updated_at INTEGER);
+            CREATE TABLE IF NOT EXISTS forecast (item_id TEXT, date TEXT, side TEXT,
+              PRIMARY KEY (item_id, date));
+        """)
+        con.execute("INSERT INTO factor_latest VALUES ('A','2026-10-13',10.0,1)")
+        con.execute("INSERT INTO forecast VALUES ('A','2026-10-13','buy')")
+        con.commit()
+        abort_no_cross_section(con, "2026-10-13", dry_run=False)
+        meta = dict(con.execute("SELECT k, v FROM meta"))
+        check("写入 no_cross_section_on 标记（接口据此判断）",
+              meta.get("no_cross_section_on") == "2026-10-13", f"{meta.get('no_cross_section_on')}")
+        check("last_run 同时更新", meta.get("last_run") == "2026-10-13", f"{meta.get('last_run')}")
+        con.close()
+
+    rd = (SERVER / "pipeline" / "run_daily.py").read_text(encoding="utf-8")
+    check("两个空截面分支用同一套收尾（新鲜度分支原先直接 return）",
+          rd.count("abort_no_cross_section(con, day, dry_run)") >= 2,
+          f"调用点 {rd.count('abort_no_cross_section(con, day, dry_run)')} 个")
+    check("成功路径会清掉该标记（否则同日先失败后成功会一直返回空）",
+          '"no_cross_section_on", "v": ""' in rd)
+
+    api = (SERVER / "app.py").read_text(encoding="utf-8")
+    check("候选接口识别「最近一次运行无截面」，不退回昨天",
+          "no_cross_section_on" in api and "最近一次运行没有产生有效截面" in api)
 
 
 def main() -> int:
@@ -1053,6 +1207,10 @@ def main() -> int:
     test_fallback_never_overwrites_primary_platform()
     test_log_records_are_formattable()
     test_dry_run_never_touches_data_and_freshness_gate()
+    test_invalid_quote_does_not_relabel_source()
+    test_count_freshness_is_independent()
+    test_liquidity_snapshot_overrides_stale_price_row()
+    test_no_cross_section_contract()
     print("\n" + "=" * 62)
     if FAIL:
         print(f"结果：{len(FAIL)} 项失败 → {FAIL}")

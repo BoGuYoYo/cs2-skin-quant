@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS case_meta (
 CREATE TABLE IF NOT EXISTS snap (
   item_id TEXT, date TEXT, sell REAL, bid REAL,
   listings INTEGER, volume INTEGER, supply INTEGER, ts INTEGER,
-  src TEXT,
+  src TEXT, count_ts INTEGER,
   PRIMARY KEY (item_id, date)
 );
 CREATE INDEX IF NOT EXISTS ix_snap ON snap(item_id, date);
@@ -100,8 +100,8 @@ def _upsert_sql(table: str, cols: list[str], pk: list[str]) -> str:
 #: 这一条**不加新旧比较**：K 线是「某个日期的权威日线」，它来收尾就该允许覆盖
 #: （例如次日 07:00 用它把昨天那根未封口的 bar 定稿）。
 SNAP_UPSERT = """
-INSERT INTO snap (item_id, date, sell, bid, listings, volume, supply, ts, src)
-VALUES (?,?,?,?,?,?,?,?,?)
+INSERT INTO snap (item_id, date, sell, bid, listings, volume, supply, ts, src, count_ts)
+VALUES (?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(item_id, date) DO UPDATE SET
   sell     = COALESCE(excluded.sell,     snap.sell),
   bid      = COALESCE(excluded.bid,      snap.bid),
@@ -109,22 +109,51 @@ ON CONFLICT(item_id, date) DO UPDATE SET
   volume   = COALESCE(excluded.volume,   snap.volume),
   supply   = COALESCE(excluded.supply,   snap.supply),
   ts       = COALESCE(excluded.ts,       snap.ts),
-  src      = COALESCE(excluded.src,      snap.src)
+  src      = COALESCE(excluded.src,      snap.src),
+  count_ts = COALESCE(excluded.count_ts, snap.count_ts)
 """
 
-#: snap 专用（快照/挂单量通道）：**必须比较新旧**，而且**回退数据不许顶掉主平台数据**。
+#: 价格那一组的写入条件（sell / bid / ts / src 同生共死）：
+#:   NEW_PRICE  这次带了有效价格（excluded.ts 非空）
+#:   NEWER      不比库里已有的价格旧
+#:   SRC_OK     不是「回退平台顶掉主平台」
 #:
-#: 两个条件缺一不可：
-#: 1) `excluded.ts >= snap.ts` —— 旧的报价不许覆盖新的。
-#:    踩过的坑：原先两条通道共用无比较的 UPSERT，后写者胜出；而 batch 连
-#:    响应里的 updateTime 都没用（写的是本机时刻），根本无从判断新旧。
-#: 2) 回退平台（C5/YOUPIN/…）不许覆盖 BUFF 行。
-#:    踩过的坑：先有 BUFF ¥52，后来一条更新的悠悠有品 ¥50 把整行改成 YOUPIN，
-#:    而 load_history 会按 src 过滤掉非 BUFF 行 —— 结果原来那条有效的 BUFF ¥52
-#:    也一起没了。升级方向是允许的（BUFF 报价可以覆盖回退行）。
-SNAP_UPSERT_QUOTE = SNAP_UPSERT.rstrip() + f"""
-WHERE (excluded.ts IS NULL OR snap.ts IS NULL OR excluded.ts >= snap.ts)
-  AND (excluded.src = '{PRICE_PLATFORM}' OR snap.src IS NULL OR snap.src <> '{PRICE_PLATFORM}')
+#: ⚠️ src 必须跟着价格一起判 —— 审查发现的坑：库里本来是一条 C5 ¥50，
+#: 随后来了个 BUFF 的**零报价**（价格无效）。原先只有价格被 COALESCE 保住，
+#: src 却照改不误，于是那条 C5 价被贴上了 BUFF 标签，顺利通过 src 过滤进了模型。
+#: 来源必须描述"当前这条价格到底是谁的"。
+_PRICE_WRITE_COND = (
+    "excluded.ts IS NOT NULL"
+    " AND (snap.ts IS NULL OR excluded.ts >= snap.ts)"
+    f" AND (excluded.src = '{PRICE_PLATFORM}' OR snap.src IS NULL OR snap.src <> '{PRICE_PLATFORM}')"
+)
+
+#: 流动性那一组的写入条件（listings / volume / supply / count_ts）：
+#: 价格与数量是**两次独立的观测**，各带各的时间戳。
+#: 踩过的坑：价格无效时把 ts 置空，而 UPSERT 又允许 NULL 时间戳无条件更新 ——
+#: 一条更旧的「零挂单量」就把刚刚写进去的 80 改成了 0，而价格时间戳还显示是新的。
+#:
+#: 这里**不**按平台过滤数量（试过，不行）：没有在售价时 src 本来就是空的，
+#: 一卡平台条件就等于「今天没人挂售」这条最有用的流动性信息也写不进来。
+#: 口径纪律对**价格**最重要（混平台会凭空跳出一根假 K 线），
+#: 而挂单量只用来做「<20 就不看」这种粗粒度流动性闸门，平台差异是次要的。
+_COUNT_WRITE_COND = (
+    "excluded.count_ts IS NOT NULL"
+    " AND (snap.count_ts IS NULL OR excluded.count_ts >= snap.count_ts)"
+)
+
+SNAP_UPSERT_QUOTE = f"""
+INSERT INTO snap (item_id, date, sell, bid, listings, volume, supply, ts, src, count_ts)
+VALUES (?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(item_id, date) DO UPDATE SET
+  sell     = CASE WHEN {_PRICE_WRITE_COND} THEN COALESCE(excluded.sell, snap.sell) ELSE snap.sell END,
+  bid      = CASE WHEN {_PRICE_WRITE_COND} THEN COALESCE(excluded.bid,  snap.bid)  ELSE snap.bid  END,
+  ts       = CASE WHEN {_PRICE_WRITE_COND} THEN COALESCE(excluded.ts,   snap.ts)   ELSE snap.ts   END,
+  src      = CASE WHEN {_PRICE_WRITE_COND} THEN COALESCE(excluded.src,  snap.src)  ELSE snap.src  END,
+  listings = CASE WHEN {_COUNT_WRITE_COND} THEN COALESCE(excluded.listings, snap.listings) ELSE snap.listings END,
+  volume   = CASE WHEN {_COUNT_WRITE_COND} THEN COALESCE(excluded.volume,   snap.volume)   ELSE snap.volume   END,
+  supply   = CASE WHEN {_COUNT_WRITE_COND} THEN COALESCE(excluded.supply,   snap.supply)   ELSE snap.supply   END,
+  count_ts = CASE WHEN {_COUNT_WRITE_COND} THEN COALESCE(excluded.count_ts, snap.count_ts) ELSE snap.count_ts END
 """
 
 #: kline 表跟 snap 走**同一套**新旧规则 —— 否则图表和页面价格会分裂。
@@ -171,6 +200,10 @@ def _migrate(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE snap ADD COLUMN src TEXT")
         con.commit()
         log.info("snap 补列：src（记录这条行情来自哪个平台 / kline）")
+    if "count_ts" not in have:
+        con.execute("ALTER TABLE snap ADD COLUMN count_ts INTEGER")
+        con.commit()
+        log.info("snap 补列：count_ts（价格与挂单量是两次独立观测，各有各的时间戳）")
 
     have_k = {r[1] for r in con.execute("PRAGMA table_info(kline)")}
     if "ts" not in have_k:
@@ -367,6 +400,7 @@ def write_daily_snapshot(
         plat = str(row.get("platform") or "?")
         if plat != prefer:
             fallback[plat] = fallback.get(plat, 0) + 1
+        quote_ts = int(row.get("updateTime") or now_ts)
         con.execute(
             SNAP_UPSERT_QUOTE,   # 不是 INSERT OR REPLACE，也不是无比较的 UPSERT
             (
@@ -377,10 +411,13 @@ def write_daily_snapshot(
                 _valid_count(row.get("sellCount")),
                 None,       # 成交量由 Steam 侧补充
                 None,       # 存世量需另接数据源
-                # 价格无效时不写 ts：否则一条"没有价格的报价"会顶掉已有行的时间戳，
-                # 反而把随后到达的有效报价（时间戳更旧）挡在门外
-                int(row.get("updateTime") or now_ts) if price_ok else None,
-                plat,
+                # 价格与数量是两次独立的观测：
+                #   ts       —— 价格的观测时间，价格无效就置空（不许它顶掉已有价格的时间戳，
+                #                也不许它把 src 改成 BUFF 而价格其实是别的平台的）
+                #   count_ts —— 挂单量自己的观测时间，无论价格是否有效都要如实写
+                quote_ts if price_ok else None,
+                plat if price_ok else None,
+                quote_ts,
             ),
         )
         n += 1
@@ -681,7 +718,7 @@ def write_kline_rows(
         today_bar = day >= today
         con.execute(
             SNAP_UPSERT_QUOTE if today_bar else SNAP_UPSERT,
-            (item_id, day, c, None, None, None, None, ts, src),
+            (item_id, day, c, None, None, None, None, ts, src, None),
         )
         if write_kline:
             if today_bar:
@@ -845,6 +882,45 @@ def load_history(
     df["date"] = pd.to_datetime(df["date"])
     cutoff = df["date"].max() - pd.Timedelta(days=days)
     return df[df["date"] >= cutoff].sort_values(["item_id", "date"]).reset_index(drop=True)
+
+
+def latest_listings(con: sqlite3.Connection, items: list[str] | None = None) -> pd.DataFrame:
+    """每个品种**最新一次有挂单量的观测**（不管那天有没有有效价格）。
+
+    为什么要单独读一遍（审查发现）：
+        「今天没有在售价（sellPrice=0）→ 价格写 NULL，挂单量记成 0」
+        这条信息在 load_history 里会被 dropna 丢掉（它只保留有价格的行），
+        于是截面拿到的其实是**昨天的价格 + 昨天的挂单量**；
+        而昨天的挂单量可能是 100（合格），闸门就把一个"今天已经没人挂售"的品种
+        当成合格放行了 —— 也正是这条规则想剔除的对象。
+
+    所以：价格取「最后一根有效价」（load_history），流动性取「最新一次快照」（本函数），
+    两者按品种关联。返回 item_id / listings / listings_date / count_ts。
+    """
+    conds = ["s.listings IS NOT NULL"]
+    params: list[Any] = []
+    if items is not None:
+        if not items:
+            return pd.DataFrame()
+        conds.insert(0, "s.item_id IN (%s)" % ",".join(["?"] * len(items)))
+        params = list(items)
+
+    df = pd.read_sql_query(
+        "SELECT s.item_id, s.listings, s.date AS listings_date, s.count_ts "
+        "  FROM snap s "
+        "  JOIN (SELECT item_id, MAX(date) AS d FROM snap "
+        "         WHERE listings IS NOT NULL GROUP BY item_id) m "
+        "    ON m.item_id = s.item_id AND m.d = s.date "
+        " WHERE " + " AND ".join(conds),
+        con,
+        params=params,
+    )
+    if df.empty:
+        return df
+    for c in ("listings", "count_ts"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
 
 
 def backfill_from_dump(con: sqlite3.Connection, dump_dir: str | Path) -> int:

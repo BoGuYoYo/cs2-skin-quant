@@ -179,7 +179,7 @@ def _snap_items(con) -> list[str]:
     ]
 
 
-def _apply_liquidity_gate(latest: pd.DataFrame, cfg: Cfg) -> pd.DataFrame:
+def _apply_liquidity_gate(latest: pd.DataFrame, cfg: Cfg, day: str | None = None) -> pd.DataFrame:
     """用户规则：「日交易量低的不看（小于 20 一天）」。
 
     比的是在售挂单量（唯一可得的流动性代理，理由见 collector.collect_listings）。
@@ -189,6 +189,10 @@ def _apply_liquidity_gate(latest: pd.DataFrame, cfg: Cfg) -> pd.DataFrame:
         如果这时写成 `COALESCE(listings, 0) >= 20`，就等于把所有品种判成「不合格」，
         页面直接空掉 —— 这正是 /api/screener 栽过的跟头（同一个坑，第二次出现）。
         所以纪律是：**不知道就放行**，并每天在日志里喊一声闸门当前没生效。
+
+    ⚠️ 但「挂单量快照本身过期」也属于「不知道」（审查发现）：
+    截面里的 listings 来自 collector.latest_listings（最新一次快照），
+    如果那次快照是 10 天前的，拿它当今天的流动性同样不可信 —— 按未知放行。
     """
     if latest.empty:
         return latest
@@ -197,8 +201,17 @@ def _apply_liquidity_gate(latest: pd.DataFrame, cfg: Cfg) -> pd.DataFrame:
         return latest
 
     known = latest["listings"].notna()
+    if day is not None and "listings_date" in latest.columns:
+        ld = pd.to_datetime(latest["listings_date"], errors="coerce")
+        age = (pd.Timestamp(day) - ld).dt.days
+        expired = known & ~age.between(0, cfg.infer_max_age_days)
+        if bool(expired.any()):
+            log.info("流动性闸门：%d 个品种的挂单量快照已过期（超 %d 天），按「不知道」放行",
+                     int(expired.sum()), cfg.infer_max_age_days)
+        known = known & ~expired
+
     if not bool(known.any()):
-        log.warning("流动性闸门未生效：listings 全为空（挂单量采集器还没积累出数据）"
+        log.warning("流动性闸门未生效：没有可用的挂单量快照"
                     " —— 不把「不知道」当「不合格」，全部放行")
         return latest
 
@@ -218,7 +231,11 @@ def abort_no_cross_section(con, day: str, dry_run: bool) -> None:
       - forecast（今天那批）：/api/candidates 用 `date = MAX(date)` +
         LEFT JOIN factor_latest，于是会出现「因子已被清空、却仍在推荐买入」
         的假候选（价格字段变 null，但 side='buy' 还在）。
-    不处理的后果就是页面在推荐一批不存在的标的。
+
+    另外还要在 meta 里留一个**显式标记**（审查第二轮发现的问题）：
+    光把今天的预测删掉，候选接口会退回到 `MAX(date)` = 昨天，
+    继续拿昨天的买入建议当今天的结果。标记 no_cross_section_on = day
+    让接口能判断「最近一次运行就是无截面」，从而返回空而不是拿旧记录顶替。
 
     ⚠️ --dry-run 的约定是「什么也不改」。审查发现原实现的这个分支
     先执行了 prune 再检查 dry_run —— 试跑会删真实数据，这是最不该有的行为。
@@ -233,10 +250,20 @@ def abort_no_cross_section(con, day: str, dry_run: bool) -> None:
         con.commit()
     except Exception as e:      # noqa: BLE001
         log.warning("清理今日 forecast 失败：%s", e)
-    log.warning("已清理 factor_latest %d 条、今日 forecast %d 条（本轮无截面）", n1, n2 or 0)
+    try:
+        now_ts = int(time.time())
+        con.executemany(
+            "INSERT INTO meta (k, v, updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at",
+            [("last_run", day, now_ts), ("no_cross_section_on", day, now_ts)],
+        )
+        con.commit()
+    except Exception as e:      # noqa: BLE001
+        log.warning("写入 no_cross_section 标记失败：%s", e)
+    log.warning("已清理 factor_latest %d 条、今日 forecast %d 条，并标记今天无截面", n1, n2 or 0)
 
 
-def _apply_freshness_gate(latest: pd.DataFrame, cfg: Cfg) -> pd.DataFrame:
+def _apply_freshness_gate(latest: pd.DataFrame, cfg: Cfg, day: str) -> pd.DataFrame:
     """只预测「行情够新、且特征窗口已预热」的品种。
 
     踩过的坑（审查指出）：截面取的是「每个品种在这个窗口内的最后一行」，
@@ -245,6 +272,11 @@ def _apply_freshness_gate(latest: pd.DataFrame, cfg: Cfg) -> pd.DataFrame:
     旧价格就这么被"重新包装"成今日价格骗过筛选页；而流动性闸门只看挂单量，
     拦不住这种事。
 
+    ⚠️ 参照日必须用**运行当天（北京）**，不能用截面里的 max(date)。
+    第二处审查正是这么抓到的：如果全池都停更了（最新行情是 09-29），
+    `ref = 截面最大值` 就等于 09-29，所有人年龄都是 0 → 一个都拦不住，
+    等于把半个月前的行情当成今天的。未来日期同样要拒（时钟漂移/脏数据）。
+
     is_warm 同理：它本来就是 features.build 里「长窗口特征齐全」的标记，
     训练时用了、推理时也该用 —— 否则新上架或数据稀疏的品种会拿一大堆
     ffill + 0 的向量去预测，输出看着正常但没有任何信息。
@@ -252,13 +284,16 @@ def _apply_freshness_gate(latest: pd.DataFrame, cfg: Cfg) -> pd.DataFrame:
     if latest.empty:
         return latest
     n0 = len(latest)
+    ref = pd.Timestamp(day)
 
     if "date" in latest.columns:
-        d = pd.to_datetime(latest["date"])
-        ref = d.max()
-        fresh = (ref - d).dt.days <= cfg.infer_max_age_days
+        d = pd.to_datetime(latest["date"], errors="coerce")
+        age = (ref - d).dt.days
+        fresh = age.between(0, cfg.infer_max_age_days)      # 负数 = 未来日期，一并拒掉
+        n_future = int((age < 0).sum())
+        n_stale = int((age > cfg.infer_max_age_days).sum())
     else:                                   # 理论上不会发生，兜底放行
-        ref, fresh = None, pd.Series(True, index=latest.index)
+        fresh, n_future, n_stale = pd.Series(True, index=latest.index), 0, 0
 
     if "is_warm" in latest.columns:
         warm = latest["is_warm"].fillna(False).astype(bool)
@@ -266,11 +301,11 @@ def _apply_freshness_gate(latest: pd.DataFrame, cfg: Cfg) -> pd.DataFrame:
         warm = pd.Series(True, index=latest.index)
 
     keep = fresh & warm
-    dropped_stale = int((~fresh).sum())
-    dropped_cold = int((~(fresh & warm)).sum()) - dropped_stale
-    log.info("新鲜度/预热闸门：参考日 %s，行情超 %d 天的 %d 个、未预热的 %d 个；保留 %d/%d",
-             ref.strftime("%Y-%m-%d") if ref is not None else "?", cfg.infer_max_age_days,
-             dropped_stale, dropped_cold, int(keep.sum()), n0)
+    n_cold = int((~(fresh & warm)).sum()) - n_stale      # 只冷不旧的那部分
+    log.info("新鲜度/预热闸门：基准日 %s（北京），行情超 %d 天的 %d 个、"
+             "未来日期 %d 个、未预热的 %d 个；保留 %d/%d",
+             day, cfg.infer_max_age_days, n_stale, n_future, max(n_cold, 0),
+             int(keep.sum()), n0)
     return latest[keep].reset_index(drop=True)
 
 
@@ -524,14 +559,31 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
         return 6
     log.info("推理截面 %d 行 × %d 列（近 %d 天）", len(latest), latest.shape[1], cfg.infer_days)
 
+    # 流动性快照要**单独覆盖**进来（审查发现）：
+    # 价格行是「最后一根有效价」，而今天的「无在售价 + 挂单量为 0」那条记录
+    # 因为价格是 NULL 早被 load_history 丢掉了 —— 于是闸门看到的是**昨天的**
+    # 挂单量（可能合格），把一个今天已经没人挂售的品种放行。
+    # 价格用价格口径、流动性用流动性口径，各自取最新，再按品种关联。
+    lst = collector.latest_listings(con, all_items)
+    if not lst.empty:
+        latest = latest.drop(columns=["listings"], errors="ignore").merge(lst, on="item_id", how="left")
+        log.info("流动性快照覆盖：%d 个品种有挂单量记录（其中 %d 条来自无有效价格的行）",
+                 int(lst["listings"].notna().sum()),
+                 int((lst["listings"] == 0).sum()))
+    else:
+        latest["listings_date"] = pd.NaT
+
     # 先剔掉「行情太旧 / 特征没预热」的品种：它们不该被包装成今天的截面
-    latest = _apply_freshness_gate(latest, cfg)
+    latest = _apply_freshness_gate(latest, cfg, day)
     if latest.empty:
-        log.error("新鲜度闸门把截面全部剔除，无法继续")
+        # 两个「无截面」分支必须用**同一套收尾**（审查发现：新鲜度这条分支
+        # 直接 return，旧因子和今日旧预测都留在了库里）
+        log.error("新鲜度闸门把截面全部剔除")
+        abort_no_cross_section(con, day, dry_run)
         return 6
 
     # 用户规则：日交易量（用挂单量代理）< 20 不看
-    latest = _apply_liquidity_gate(latest, cfg)
+    latest = _apply_liquidity_gate(latest, cfg, day)
     if latest.empty:
         # 连截面都没了：库里还留着上一轮的 factor_latest 与今天的 forecast，
         # 都不该继续展示（详见 abort_no_cross_section 的注释）。
@@ -704,6 +756,9 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
                     {"k": "last_run", "v": day, "updated_at": now_ts},
                     {"k": "horizon", "v": str(cfg.horizon), "updated_at": now_ts},
                     {"k": "cqr_Q", "v": str(calib_meta.get("cqr_Q")), "updated_at": now_ts},
+                    # 清掉「今天无截面」的标记：否则同一天先失败后成功时，
+                    # /api/candidates 会一直以为最近一次运行没有截面（空串即视为无标记）
+                    {"k": "no_cross_section_on", "v": "", "updated_at": now_ts},
                 ],
                 {},
             ),

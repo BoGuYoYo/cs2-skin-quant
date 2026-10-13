@@ -210,6 +210,21 @@ def candidates(
 ) -> dict[str, Any]:
     con = db()
     try:
+        if date is None:
+            # 最近一次运行如果就是「无截面」，不能退回到 `MAX(date)` ——
+            # 那会把**昨天的买入建议**当成今天的结果返回（审查发现的组合问题：
+            # run_daily 那边清了今天的预测，接口这边自动往前找了昨天的）。
+            # 历史记录仍然保留，只是默认视图必须承认「今天没有候选」。
+            try:
+                meta = {r["k"]: r["v"] for r in con.execute("SELECT k, v FROM meta")}
+            except sqlite3.Error:
+                meta = {}
+            marker = meta.get("no_cross_section_on") or ""
+            if marker and marker == (meta.get("last_run") or ""):
+                log.info("最近一次运行（%s）无有效截面，返回空候选", marker)
+                return ok({"date": marker, "rows": [],
+                           "reason": "最近一次运行没有产生有效截面"})
+
         d = date or _latest_date(con, "forecast")
         if not d:
             return ok({"date": None, "rows": []})
