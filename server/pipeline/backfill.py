@@ -92,14 +92,18 @@ def fetch_kline(session: requests.Session, api_key: str, name: str, ktype: int, 
     return data if isinstance(data, list) else []
 
 
-def write_kline(con: sqlite3.Connection, item_id: str, rows: list) -> int:
+def write_kline(con: sqlite3.Connection, item_id: str, rows: list,
+                platform: str = collector.PRICE_PLATFORM) -> int:
     """转发到 collector.write_kline_rows —— 只保留一份实现，避免两边漂移。
 
     这里原先有一份独立实现，字段顺序解析是错的（把 low 当成了 close），
     导致 150 万行历史价格全被记成当日最低价。修的时候得同时改两处、极易漏 ——
     所以统一到 collector 一处。
+
+    platform 必须透传：不传就会默认记成 BUFF，于是「用 STEAM 回填」的数据
+    来源记录反而是错的（审查发现的问题）。
     """
-    return collector.write_kline_rows(con, item_id, rows, write_kline=True)
+    return collector.write_kline_rows(con, item_id, rows, write_kline=True, src=platform)
 
 
 def status(con: sqlite3.Connection) -> None:
@@ -179,7 +183,7 @@ def main() -> int:
     for i, name in enumerate(todo, 1):
         try:
             rows = fetch_kline(session, key, name, args.ktype, args.platform)
-            n = write_kline(con, name, rows)
+            n = write_kline(con, name, rows, platform=args.platform)
             if n:
                 ok += 1
                 total_rows += n

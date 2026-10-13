@@ -19,9 +19,14 @@ from typing import Any, Iterable
 import pandas as pd
 import requests
 
-from .config import DOMAIN_EXCLUDE_SQL
+from .config import BEIJING, DOMAIN_EXCLUDE_SQL
 
 log = logging.getLogger("collector")
+
+#: 全系统唯一的价格口径：只用 BUFF 的底价做主序列。
+#: 任何一条通道（K 线 / 快照 / 读历史）都必须认这个常量，
+#: 否则同一列 sell 里混进别的平台，会凭空跳出一根假 K 线。
+PRICE_PLATFORM = "BUFF"
 
 STEAMDT_BASE = "https://open.steamdt.com"
 BATCH_MAX = 100  # /price/batch 一次最多 100 个 marketHashName
@@ -233,7 +238,7 @@ def fetch_base(api_key: str) -> list[dict[str, Any]]:
     return body.get("data") or []
 
 
-def pick_platform(block: dict[str, Any], prefer: str = "BUFF") -> dict[str, Any] | None:
+def pick_platform(block: dict[str, Any], prefer: str = PRICE_PLATFORM) -> dict[str, Any] | None:
     """统一口径：全系统只用同一个平台的底价做主序列，避免混口径造成人工暴跌。
 
     ⚠️ 回退是**例外**，不是常态：BUFF 缺失时取最低价平台，但调用方必须
@@ -250,11 +255,41 @@ def pick_platform(block: dict[str, Any], prefer: str = "BUFF") -> dict[str, Any]
     return min(rows, key=lambda x: x.get("sellPrice") or 9e9)
 
 
+def _valid_price(v: Any) -> bool:
+    """报价必须是有限的**正数**。
+
+    踩过的坑：原先直接写 sellPrice，于是 0 / 负数 / NaN 都能进库。
+    而 load_history() 只 dropna（去掉 NULL），**不去掉 0** ——
+    一笔「0 元报价」会在特征里表现为 −100% 的暴跌，直接污染标签和训练。
+    实测：库里曾经有 1,552 行 sell <= 0（见 scripts/fix_invalid_prices.py）。
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(f) and f > 0
+
+
+def _valid_count(v: Any) -> int | None:
+    """挂单量/求购量：非负整数，否则当没数据（None）。
+
+    注意 0 是**合法**值（真的没人挂单），它跟「没拿到数据」含义不同：
+    前者会被流动性闸门剔除，后者按「不知道就放行」处理。
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f < 0:
+        return None
+    return int(f)
+
+
 def write_daily_snapshot(
     con: sqlite3.Connection,
     blocks: Iterable[dict[str, Any]],
     date: str,
-    prefer: str = "BUFF",
+    prefer: str = PRICE_PLATFORM,
 ) -> int:
     """写入当日快照。
 
@@ -265,8 +300,12 @@ def write_daily_snapshot(
 
     ⚠️ ts 用响应里的 updateTime（这条报价自己的时间），不是本机写入时刻。
     否则「旧报价不许覆盖新报价」这条约束根本无从判断（见 SNAP_UPSERT_QUOTE）。
+
+    ⚠️ 报价必须过 _valid_price：0 / 负数 / NaN 一律丢弃并计数，
+    绝不能让它变成价格序列里的一根「−100% 暴跌」。
     """
     n = 0
+    skipped = 0
     fallback: dict[str, int] = {}
     now_ts = int(time.time())
     for blk in blocks:
@@ -274,6 +313,10 @@ def write_daily_snapshot(
         row = pick_platform(blk, prefer)
         if not name or not row:
             continue
+        if not _valid_price(row.get("sellPrice")):
+            skipped += 1
+            continue
+        bid = row.get("biddingPrice")
         plat = str(row.get("platform") or "?")
         if plat != prefer:
             fallback[plat] = fallback.get(plat, 0) + 1
@@ -282,9 +325,9 @@ def write_daily_snapshot(
             (
                 name,
                 date,
-                row.get("sellPrice"),
-                row.get("biddingPrice"),
-                row.get("sellCount"),
+                float(row["sellPrice"]),
+                float(bid) if _valid_price(bid) else None,
+                _valid_count(row.get("sellCount")),
                 None,       # 成交量由 Steam 侧补充
                 None,       # 存世量需另接数据源
                 int(row.get("updateTime") or now_ts),
@@ -293,10 +336,14 @@ def write_daily_snapshot(
         )
         n += 1
     con.commit()
+    if skipped:
+        log.warning("丢弃 %d 条无效报价（sellPrice 非正 / 非有限）—— 静默写入会让它们"
+                    "在特征里变成 −100% 暴跌", skipped)
     if fallback:
-        log.warning("平台回退 %d 个品种（本地样本里 %s 缺失）：%s —— "
+        log.warning("平台回退 %d 个品种（%s 缺失）：%s —— "
                     "这些行的 src 不是 %s，混口径会在价格序列里制造人工跳价；"
-                    "需要时可按 src 过滤", sum(fallback.values()), prefer, fallback, prefer)
+                    "load_history 已按 src 过滤，它们不会进模型",
+                    sum(fallback.values()), prefer, fallback, prefer)
     return n
 
 
@@ -546,7 +593,7 @@ def write_kline_rows(
     item_id: str,
     rows: list,
     write_kline: bool = True,
-    src: str = "BUFF",
+    src: str = PRICE_PLATFORM,
 ) -> int:
     """K 线行 → snap（价格）+ kline（完整 OHLC）
 
@@ -559,9 +606,16 @@ def write_kline_rows(
 
     ⚠️ 时间戳是 UTC 16:00（= 北京时间 00:00）。必须按北京时间归日，
        否则整条序列偏移一天（踩过：10-10 的数据被记成 10-09）。
+
+    ⚠️ 新旧保护要分开对待（踩过的坑：只给 batch 加了保护、K 线仍无比较）：
+       - **历史日线是「某天的权威定稿」**：次日补写/修正就该覆盖，
+         所以走无比较的 SNAP_UPSERT。
+       - **今天那根还没封口**：它是盘中值，必须和报价一样受新旧保护 ——
+         否则一根 5 分钟前的 K 线会把刚抓到的更新报价顶回去，价格序列倒退。
     """
     n = 0
     bad = 0
+    today = datetime.now(BEIJING).strftime("%Y-%m-%d")
     for row in rows:
         try:
             ts = int(row[0])
@@ -573,9 +627,10 @@ def write_kline_rows(
             bad += 1
             continue
         day = datetime.fromtimestamp(ts + 8 * 3600, tz=timezone.utc).strftime("%Y-%m-%d")
-        # 关键：K 线只提供价格，用 SNAP_UPSERT 保证它不会把 batch 采集补上的
+        upsert = SNAP_UPSERT if day < today else SNAP_UPSERT_QUOTE
+        # 关键：K 线只提供价格，用 UPSERT 保证它不会把 batch 采集补上的
         # bid / listings 清成 NULL（原先的 INSERT OR REPLACE 会）
-        con.execute(SNAP_UPSERT, (item_id, day, c, None, None, None, None, ts, src))
+        con.execute(upsert, (item_id, day, c, None, None, None, None, ts, src))
         if write_kline:
             con.execute(
                 "INSERT INTO kline (item_id, date, o, h, l, c, v) VALUES (?,?,?,?,?,?,?) "
@@ -632,7 +687,9 @@ def collect_daily_kline(
     for i, name in enumerate(names, 1):
         try:
             rows = fetch_kline(session, api_key, name, KLINE_TYPE_DAY, platform)
-            n = write_kline_rows(con, name, rows)
+            # src 必须传真实平台：不传会默认成 BUFF，于是「用 STEAM 回填」
+            # 会被记成 BUFF 数据，来源记录反而变成误导（审查发现的问题）。
+            n = write_kline_rows(con, name, rows, src=platform)
             if n:
                 stats["ok"] += 1
                 stats["rows"] += n
@@ -693,14 +750,24 @@ def load_history(
     items: 只取这些品种（None = 全部）。
         4G 内存的机器上一次读 542 万行再算特征会被内核 OOM 杀掉，
         所以 run_daily 改成按品种分块调用本函数（见 _load_feats_batched）。
+
+    平台口径：**只读 BUFF 与未标注行的价格**。
+        src 是本项目自己记的来源（C5/YOUPIN/STEAM = 当时 BUFF 缺失、回退抓的）。
+        混口径会在同一列里制造人工跳价：悠悠有品的 ¥50 和 BUFF 的 ¥52 之间
+        本来就有天然价差，混进来就会被当成行情跳变。
+        src IS NULL 的是加 src 列之前的历史行（那时只有 K 线 BUFF 与少量回退），
+        保留它们；其余非 BUFF 的一律不进模型（它们仍然留在库里可供诊断）。
     """
-    where = ""
-    params: list[Any] = []
+    # 条件一律走 WHERE（别拼进 JOIN 的 ON —— 那样被过滤掉的行会变成一堆
+    # item 列为 NULL 的幽灵行，而不是干净地消失）
+    conds = ["(s.src IS NULL OR s.src = ?)"]
+    params: list[Any] = [PRICE_PLATFORM]
     if items is not None:
         if not items:
             return pd.DataFrame()
-        where = " WHERE s.item_id IN (%s)" % ",".join(["?"] * len(items))
-        params = list(items)
+        conds.insert(0, "s.item_id IN (%s)" % ",".join(["?"] * len(items)))
+        params = list(items) + [PRICE_PLATFORM]
+    where = " WHERE " + " AND ".join(conds)
 
     df = pd.read_sql_query(
         """SELECT s.item_id, s.date, s.sell AS price, s.bid, s.listings, s.volume, s.supply,
@@ -718,6 +785,12 @@ def load_history(
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     df = df.dropna(subset=["price"])
+    # 读到 0 / 负价时直接当无效（写入端已校验，这里是防历史脏数据的安全网 ——
+    # 库里曾经有 1,552 行 sell <= 0，见 scripts/fix_invalid_prices.py）
+    n_bad = int((df["price"] <= 0).sum())
+    if n_bad:
+        log.warning("load_history：跳过 %d 行非正价格（历史脏数据）", n_bad)
+        df = df[df["price"] > 0]
     df["date"] = pd.to_datetime(df["date"])
     cutoff = df["date"].max() - pd.Timedelta(days=days)
     return df[df["date"] >= cutoff].sort_values(["item_id", "date"]).reset_index(drop=True)

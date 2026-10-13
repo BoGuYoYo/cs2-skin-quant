@@ -3,7 +3,18 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import timedelta, timezone
 from pathlib import Path
+
+#: 全系统统一用北京时间归日。
+#:
+#: 踩过的坑：这个项目同时存在三套日期口径 ——
+#:   K 线入库按北京时间（ts + 8h）、挂单量采集用本机时间（也是北京）、
+#:   基准日却用了 UTC。而定时器设在**北京 07:00**（= UTC 前一日 23:00），
+#: 于是 07:00 那次任务算出的 day 是「昨天」：看板基准日整天慢一天，
+#: 更糟的是 batch 采集模式会把报价直接写进前一天的价格行。
+#: 现在只保留这一个常量，任何按天划界的地方都必须用它。
+BEIJING = timezone(timedelta(hours=8))
 
 
 def _env(name: str, default: str = "") -> str:

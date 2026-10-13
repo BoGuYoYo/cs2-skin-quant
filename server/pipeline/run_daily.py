@@ -15,8 +15,8 @@ import math
 import os
 import sys
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from datetime import datetime
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover
 from . import cases as cases_mod
 from . import collector, decide, features, labels, llm
 from .calibrate import CQR
-from .config import CFG, DOMAIN_EXCLUDE_SQL, FEATURE_COLS, Cfg
+from .config import BEIJING, CFG, DOMAIN_EXCLUDE_SQL, FEATURE_COLS, Cfg
 from .model import QuantileModel, acceptance, walk_forward
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -48,18 +48,17 @@ log = logging.getLogger("daily")
 
 
 # ------------------------------------------------------------------ 工具
-#: 全系统统一用北京时间归日。
+#: 全系统统一用北京时间归日。常量唯一来源在 pipeline.config.BEIJING。
 #:
 #: 踩过的坑：这里原先用 UTC 日期（datetime.now(timezone.utc)），而
 #:   1) K 线入库是按北京时间归日的（ts + 8h），
 #:   2) 挂单量采集用的是本机时间（也是北京），
-#:   3) 定时器设在**北京 07:00**（= UTC 次日 23:00）——
+#:   3) 定时器设在**北京 07:00**（= UTC 前一日 23:00）——
 #: 三件事凑在一起就错位：07:00 那次任务算出来的 day 是**昨天**。
 #: 实测：08:42 完成的 07:00 任务把 day 写成 2026-10-11，于是
 #:   看板的「基准日」整整一天都慢一天，直到 19:00 那次才出现 10-12；
 #:   而且 forecast 按 day 做 replace_date，等于把前一天的快照覆盖掉了。
 #: batch 采集模式更糟：报价会直接写进前一天的价格行。
-BEIJING = timezone(timedelta(hours=8))
 
 
 def today_str() -> str:
@@ -69,6 +68,34 @@ def today_str() -> str:
 def day_start_ts(day: str) -> int:
     """某天（北京）零点的 epoch —— 用于「清理今日旧告警」这类按天划界的操作"""
     return int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=BEIJING).timestamp())
+
+
+def prune_factor_latest(con, keep_ids: Iterable[str]) -> int:
+    """把不在本轮截面里的 factor_latest 行删掉，返回删除条数。
+
+    为什么不能只按日期删（`date <> day`）：
+      同一天会有第二次刷新（19:00 那次），早上入选、晚上被流动性闸门剔掉的品种，
+      旧行的 date **仍然是今天** —— 日期条件删不掉它，筛选页会继续拿旧价格
+      当现价展示。（审查指出的漏网场景，实测确实会残留。）
+
+    为什么用临时表而不是 NOT IN (...)：截面有 5000+ 个 id，
+    SQLite 对超长 IN 列表有变量个数上限（默认 32766，但拼字符串也很蠢）。
+    """
+    try:
+        con.execute("CREATE TEMP TABLE IF NOT EXISTS _keep_factor (item_id TEXT PRIMARY KEY)")
+        con.execute("DELETE FROM _keep_factor")
+        ids = [(str(i),) for i in keep_ids]
+        if ids:
+            con.executemany("INSERT OR IGNORE INTO _keep_factor (item_id) VALUES (?)", ids)
+        n = con.execute(
+            "DELETE FROM factor_latest "
+            "WHERE item_id NOT IN (SELECT item_id FROM _keep_factor)"
+        ).rowcount
+        con.commit()
+        return n or 0
+    except Exception as e:      # noqa: BLE001
+        log.warning("清理 factor_latest 陈旧行失败：%s", e)
+        return 0
 
 
 def load_watchlist(con) -> list[str]:
@@ -435,7 +462,13 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
     # 用户规则：日交易量（用挂单量代理）< 20 不看
     latest = _apply_liquidity_gate(latest, cfg)
     if latest.empty:
-        log.error("流动性闸门把截面全部剔除，无法继续")
+        # 连截面都没了：不能就这么 return —— factor_latest 里还留着上一轮的旧行，
+        # 页面上会继续显示它们，而它们既不是今天的、也不是本轮选出来的。
+        # 宁可空着（诚实地表示「今天没有截面」），也不拿旧数据冒充现价。
+        log.error("流动性闸门把截面全部剔除：清掉 factor_latest 旧行后退出")
+        n = prune_factor_latest(con, [])
+        if n:
+            log.warning("已清理 factor_latest %d 条（本轮无截面，不保留旧行）", n)
         return 6
     P = mdl.predict(latest[FEATURE_COLS])
 
@@ -622,19 +655,18 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
         fails.append(f"推送失败: {e}")
         log.error("推送失败：%s", e)
 
-    # factor_latest 是「当前截面」表，不是历史表。
-    # 本轮没入选的品种（被流动性闸门剔掉 / 被域筛选排除 / 本轮没数据）如果留着旧行，
+    # factor_latest 是「当前截面」表，不是历史表：本轮没入选的品种
+    # （被流动性闸门剔掉 / 被域筛选排除 / 本轮没数据）如果留着旧行，
     # 页面会拿旧价格当现价展示 —— 而 /api/screener 只按 price 和 rarity 过滤、
     # **不看日期**，所以这些旧行一定会露出来。
-    # 实测：修之前积了 10,732 行 10-11 的旧行，而当前池子只有 5,435 个品种，
-    # 也就是说筛选页里三分之二的条目是不该再出现的。
-    try:
-        n_stale = con.execute("DELETE FROM factor_latest WHERE date <> ?", (day,)).rowcount
-        con.commit()
-        if n_stale:
-            log.info("清理 factor_latest 陈旧行 %d 条（本轮未入选的品种不再展示）", n_stale)
-    except Exception as e:
-        log.warning("清理 factor_latest 陈旧行失败：%s", e)
+    # 实测：修之前积了 10,732 行 10-11 的旧行，而当时池子只有 5,435 个品种。
+    #
+    # 注意这里必须按 **item_id 白名单** 删，不能只按日期删：
+    # 同一天有第二次刷新（19:00 那次），早上入选、晚上被闸门剔掉的品种
+    # 日期仍然是今天，`date <> day` 删不掉它（审查指出的漏网场景）。
+    n_stale = prune_factor_latest(con, [r["item_id"] for r in factor_rows])
+    if n_stale:
+        log.info("清理 factor_latest 陈旧行 %d 条（本轮未入选的品种不再展示）", n_stale)
 
     # ---------------- 7. 通知 ----------------
     if candidates:

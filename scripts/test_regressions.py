@@ -318,7 +318,8 @@ def test_domain_exclude_rules() -> None:
     src_api = (SERVER / "app.py").read_text(encoding="utf-8")
     check("run_daily 用的是 config 里的同一份规则", "DOMAIN_EXCLUDE_SQL" in src_run)
     check("collector 从 config 导入而不是自己写一份",
-          "from .config import DOMAIN_EXCLUDE_SQL" in src_col)
+          "from .config import" in src_col and "DOMAIN_EXCLUDE_SQL" in src_col
+          and 'DOMAIN_EXCLUDE_SQL = "' not in src_col)
     check("API 列表接口也兜了同一份规则", "domain_exclude_sql()" in src_api)
 
     # 命名事实：StatTrak 带 ™，匹配用的是 %StatTrak%，别改成 'StatTrak '
@@ -669,11 +670,194 @@ def test_beijing_day_and_notification_order() -> None:
     # 直接全文匹配会误报。
     src_code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("#"))
     check("today_str 不再用 UTC 日期", "now(timezone.utc).strftime" not in src_code)
-    check("factor_latest 陈旧行有清理机制",
-          "DELETE FROM factor_latest WHERE date <> ?" in src_code)
+    check("factor_latest 按白名单清理（同一天第二次刷新也能淘汰）",
+          "prune_factor_latest(con," in src_code)
     check("告警不再「先截前 5 条再筛 L3」", "alert_rows[:5]" not in src_code)
     check("L3 先按分数排序再限量", "l3_alerts[: cfg.alert_push_max]" in src_code)
     check("限量阈值进了配置", CFG.alert_push_max >= 1, f"alert_push_max={CFG.alert_push_max}")
+
+
+def test_kline_today_is_guarded_history_is_not() -> None:
+    """[P1] 当日盘中 K 线不许把更新的报价顶回去；历史日线仍然允许定稿覆盖。
+
+    当时的症状：只给 batch 那条通道加了新旧保护，K 线那条仍然无比较 ——
+    于是「先写更新报价 ¥175，再来一根旧的当日 K 线」会把价格倒退成 ¥173。
+    但也不能一刀切给 K 线也加比较：**历史日线是某天的权威定稿**，
+    次日补写就该覆盖（否则昨天那根未封口的 bar 永远定不了稿）。
+    """
+    print("\n[22] K 线：当日受保护、历史仍可定稿")
+    import tempfile  # noqa: PLC0415
+    from datetime import datetime as _dt  # noqa: PLC0415
+    from datetime import timedelta as _td  # noqa: PLC0415
+
+    from pipeline.config import BEIJING as _BJ  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "k.db")
+        from datetime import datetime as _dt2  # noqa: PLC0415
+        from datetime import timezone as _tz2  # noqa: PLC0415
+
+        now = _dt.now(_BJ)
+
+        def bar_ts(day_offset: int = 0) -> int:
+            """北京某日的日线戳。
+
+            SteamDT 的日线戳是 UTC 16:00（= 北京次日 00:00），
+            write_kline_rows 用 `ts + 8h` 还原成北京日期。
+            所以「北京 D 日」的戳 = UTC D 00:00 − 8h。
+            （第一版测试把这个算错成 D 00:00 北京 − 8h，得到的 day 是 D-1，
+              于是走的是「历史定稿」分支 —— 测试自己把用例搞错了。）
+            """
+            d = (now + _td(days=day_offset)).date()
+            x = _dt2(d.year, d.month, d.day, tzinfo=_tz2.utc)   # D 00:00 UTC
+            return int(x.timestamp()) - 8 * 3600
+
+        ts_today = bar_ts(0)
+        ts_yday = bar_ts(-1)
+
+        # ① 当日：先写一条「更新的报价」，再来一根更旧的当日 K 线
+        quote_ts = ts_today + 3600 * 6          # 今天 06:00 北京（比 bar 戳更新）
+        con.execute(collector.SNAP_UPSERT_QUOTE,
+                    ("T", now.strftime("%Y-%m-%d"), 175.0, 175.0, 30, None, None, quote_ts, "BUFF"))
+        con.commit()
+        collector.write_kline_rows(con, "T", [[ts_today, 174.0, 173.0, 176.0, 172.0]])
+        got = con.execute("SELECT sell FROM snap WHERE item_id='T'").fetchone()[0]
+        check("当日旧 K 线不许把更新报价顶回去（价格不倒退）", got == 175.0, f"sell={got}")
+
+        # ② 历史：报价是昨天盘中写的（ts 更新），今天补的日线是权威定稿 → 应覆盖
+        yday = (now + _td(days=-1)).strftime("%Y-%m-%d")
+        con.execute(collector.SNAP_UPSERT_QUOTE,
+                    ("H", yday, 200.0, 200.0, 30, None, None, ts_yday + 3600 * 10, "BUFF"))
+        con.commit()
+        collector.write_kline_rows(con, "H", [[ts_yday, 190.0, 188.0, 191.0, 187.0]])
+        got2 = con.execute("SELECT sell FROM snap WHERE item_id='H'").fetchone()[0]
+        check("历史日线仍然能定稿覆盖盘中值", got2 == 188.0, f"sell={got2}")
+        con.close()
+
+
+def test_factor_latest_prune_same_day() -> None:
+    """[P1] 同一天第二次刷新，被淘汰的品种也必须清掉。
+
+    只按 `date <> day` 删是不够的：早班入选、晚班被流动性闸门剔掉的品种，
+    日期仍然是今天，日期条件删不掉它，筛选页继续拿旧价格当现价。
+    """
+    print("\n[23] factor_latest 白名单清理（同日重跑）")
+    import tempfile  # noqa: PLC0415
+
+    from pipeline.run_daily import prune_factor_latest  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "f.db")
+        con.executescript("""
+            CREATE TABLE IF NOT EXISTS factor_latest (
+              item_id TEXT PRIMARY KEY, date TEXT, price REAL, dd_from_high REAL,
+              drop_duration_days INTEGER, ret_7d REAL, ret_21d REAL, ret_30d REAL,
+              vol_21 REAL, turnover REAL, list_ratio REAL, list_slope_7d REAL,
+              supply_peer_pct REAL, supply_rigidity REAL, case_rarity_score REAL,
+              rel_ret_21d REAL, event_bearish_30d INTEGER, event_bullish_30d INTEGER,
+              updated_at INTEGER)
+        """)
+        today = "2026-10-13"
+        con.executemany("INSERT INTO factor_latest (item_id, date, price) VALUES (?,?,?)",
+                        [("A", today, 10.0), ("B", today, 20.0), ("C", "2026-10-12", 30.0)])
+        con.commit()
+
+        n = prune_factor_latest(con, ["A"])
+        left = [r[0] for r in con.execute("SELECT item_id FROM factor_latest ORDER BY item_id")]
+        check("同日被淘汰的 B 也清掉了（只按日期删会漏）", left == ["A"], f"left={left} n={n}")
+
+        n2 = prune_factor_latest(con, [])
+        left2 = [r[0] for r in con.execute("SELECT item_id FROM factor_latest")]
+        check("本轮无截面时全部清空（宁可为空，不拿旧数据冒充现价）",
+              left2 == [] and n2 == 1, f"left={left2} n={n2}")
+        con.close()
+
+
+def test_local_push_complete_replacement() -> None:
+    """[P2] 整行替换型 stage 必须把 NULL 真的写进去，且缺失列不能被过滤掉。"""
+    print("\n[24] 本地推送：整行替换 vs 部分更新")
+    import tempfile  # noqa: PLC0415
+
+    import push.to_local as tl  # noqa: PLC0415
+
+    check("factor_latest 属于整行替换", "factor_latest" in tl.COMPLETE_STAGES)
+    check("task_progress 仍走部分更新（进度条不会被清空）",
+          "task_progress" not in tl.COMPLETE_STAGES)
+
+    with tempfile.TemporaryDirectory() as td:
+        real_path = tl._DB_PATH
+        tl._DB_PATH = Path(td) / "local.db"      # type: ignore[assignment]
+        conn = tl.connect()          # 只开一个读连接：Windows 上开着文件就删不掉临时目录
+        try:
+            tl.push("factor_latest", [{"item_id": "A", "date": "2026-10-13", "price": 10.0,
+                                       "turnover": 0.123, "updated_at": 1}])
+            v1 = conn.execute(
+                "SELECT turnover FROM factor_latest WHERE item_id='A'").fetchone()[0]
+            check("首次写入换手率生效", abs(v1 - 0.123) < 1e-9, f"{v1}")
+
+            # 本轮明确发 turnover=None（没有数据源）→ 必须真的变成 NULL
+            tl.push("factor_latest", [{"item_id": "A", "date": "2026-10-13", "price": 11.0,
+                                       "turnover": None, "updated_at": 2}])
+            row = conn.execute(
+                "SELECT price, turnover FROM factor_latest WHERE item_id='A'").fetchone()
+            check("明确发 None 时必须写成 NULL（不被 COALESCE 保住旧值）",
+                  row[1] is None, f"turnover={row[1]}")
+            check("同一次推送里的新价格正常生效", abs(row[0] - 11.0) < 1e-9, f"price={row[0]}")
+
+            # 部分更新型：只送部分字段时，其余列必须保住
+            tl.push("task_progress", [{"task": "t1", "status": "running", "total": 100,
+                                       "done": 10, "updated_at": 1}])
+            tl.push("task_progress", [{"task": "t1", "status": "running", "updated_at": 2}])
+            row2 = conn.execute(
+                "SELECT total, done FROM task_progress WHERE task='t1'").fetchone()
+            check("进度表的部分更新仍保留其余列（没有被这次改动破坏）",
+                  tuple(row2) == (100, 10), f"{tuple(row2)}")
+        finally:
+            conn.close()             # 先关连接，临时目录才能被清掉
+            tl._DB_PATH = real_path      # type: ignore[assignment]
+
+
+def test_invalid_quotes_rejected_and_src_filtered() -> None:
+    """[P2] 无效报价不许入库；[P2] 非 BUFF 来源不进模型。"""
+    print("\n[25] 报价校验与平台口径")
+    import tempfile  # noqa: PLC0415
+
+    check("正常价格通过", collector._valid_price(12.5))
+    check("0 被拒（否则就是一根 −100% 暴跌）", not collector._valid_price(0))
+    check("负数被拒", not collector._valid_price(-3))
+    check("NaN / inf 被拒",
+          not collector._valid_price(float("nan")) and not collector._valid_price(float("inf")))
+    check("None 被拒", not collector._valid_price(None))
+    check("挂单量 0 是合法值（真的没人挂单）", collector._valid_count(0) == 0)
+    check("挂单量负数当没数据", collector._valid_count(-1) is None)
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "q.db")
+
+        def blk(name: str, price, plat: str = "BUFF", cnt=30) -> dict:
+            return {"marketHashName": name,
+                    "dataList": [{"platform": plat, "sellPrice": price,
+                                  "sellCount": cnt, "updateTime": 3_000_000}]}
+
+        n = collector.write_daily_snapshot(con, [
+            blk("A", 12.5), blk("B", 0), blk("C", -5), blk("D", float("nan")),
+            blk("E", 8.0, plat="YOUPIN"),
+        ], "2026-10-13")
+        rows = dict(con.execute("SELECT item_id, sell FROM snap"))
+        check("只写入合法报价（0/负数/NaN 被丢弃）",
+              set(rows) == {"A", "E"}, f"写入 {sorted(rows)} 共 {n} 条")
+        check("回退来源被如实记录", rows.get("E") == 8.0, f"{rows}")
+
+        # src 过滤：非 BUFF 的行不进模型
+        hist = collector.load_history(con, days=30)
+        kept = set(hist["item_id"])
+        check("load_history 过滤掉非 BUFF 来源", kept == {"A"}, f"kept={sorted(kept)}")
+        con.close()
+
+    src = (SERVER / "pipeline" / "collector.py").read_text(encoding="utf-8")
+    bf = (SERVER / "pipeline" / "backfill.py").read_text(encoding="utf-8")
+    check("K 线采集透传真实 platform", "write_kline_rows(con, name, rows, src=platform)" in src)
+    check("回填也透传 platform", "platform=args.platform" in bf)
 
 
 def main() -> int:
@@ -701,6 +885,10 @@ def main() -> int:
     test_kline_validation_and_source()
     test_cross_section_from_single_row()
     test_beijing_day_and_notification_order()
+    test_kline_today_is_guarded_history_is_not()
+    test_factor_latest_prune_same_day()
+    test_local_push_complete_replacement()
+    test_invalid_quotes_rejected_and_src_filtered()
     print("\n" + "=" * 62)
     if FAIL:
         print(f"结果：{len(FAIL)} 项失败 → {FAIL}")

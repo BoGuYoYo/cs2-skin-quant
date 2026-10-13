@@ -166,6 +166,20 @@ _PK: dict[str, list[str]] = {
     "runs": [],
 }
 
+#: 「整行替换」型 stage：每次推送都带齐全部列，缺值就该**写成 NULL**。
+#:
+#: 与进度表那类「部分更新」相反 —— 它们只送几个字段，必须靠 COALESCE 保住其余列。
+#: 踩过的坑：factor_latest 也走了「只写本次提供的列 + COALESCE」那套，于是
+#:   「旧换手率 0.123 → 本轮明确发 turnover=None」写完之后，日期更新成今天，
+#:   换手率却还是 0.123 —— 页面把旧值当成了新截面的有效值。
+#: （列全为 NULL 时更隐蔽：整列会被 present 过滤掉，连 NULL 都不写。）
+COMPLETE_STAGES: frozenset[str] = frozenset({
+    "factor_latest",   # 当前截面，语义是「整体替换」
+    "forecast",        # 每天一份，整行发送
+    "items",           # 目录全量
+    "case_meta",       # 箱子全量
+})
+
 
 def push(
     stage: str,
@@ -183,11 +197,15 @@ def push(
     if not rows:
         return 0
 
-    # 只写「本次真正提供的列」。
-    # 踩过的坑：原先固定用全部列 + INSERT OR REPLACE，而 REPLACE 的语义是
-    # 「删行再插入」，于是 progress.report 只传 task/status/updated_at 时，
-    # total/done/ok/rows/started_at 会被一并清成 NULL —— 前端进度条中途跳变。
-    present = [c for c in cols if any(c in r and r[c] is not None for r in rows)]
+    # 列集合：整行替换型 stage 用**全部列**（缺值写 NULL）；
+    # 其余（进度表 / meta 这类部分更新）只写「本次真正提供的列」。
+    # 踩过的坑（部分更新的来由）：原先固定用全部列 + INSERT OR REPLACE，
+    # 而 REPLACE 的语义是「删行再插入」，于是 progress.report 只传
+    # task/status/updated_at 时，total/done/ok/rows/started_at 会被一并清成
+    # NULL —— 前端进度条中途跳变。
+    complete = stage in COMPLETE_STAGES
+    present = (list(cols) if complete
+               else [c for c in cols if any(c in r and r[c] is not None for r in rows)])
     if not present:
         return 0
 
@@ -206,7 +224,12 @@ def push(
 
         ph = ",".join(["?"] * len(present))
         if use_upsert:
-            updates = ",".join(f"{c}=COALESCE(excluded.{c}, {stage}.{c})" for c in present if c not in pk)
+            if complete:
+                # 整行替换：NULL 就是 NULL，不许 COALESCE 把旧值捞回来
+                updates = ",".join(f"{c}=excluded.{c}" for c in present if c not in pk)
+            else:
+                updates = ",".join(
+                    f"{c}=COALESCE(excluded.{c}, {stage}.{c})" for c in present if c not in pk)
             sql = (
                 f"INSERT INTO {stage} ({','.join(present)}) VALUES ({ph}) "
                 f"ON CONFLICT({','.join(pk)}) DO UPDATE SET {updates}"
