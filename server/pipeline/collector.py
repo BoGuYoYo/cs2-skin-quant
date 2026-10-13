@@ -19,7 +19,7 @@ from typing import Any, Iterable
 import pandas as pd
 import requests
 
-from .config import BEIJING, DOMAIN_EXCLUDE_SQL
+from .config import BEIJING, CFG, DOMAIN_EXCLUDE_SQL
 
 log = logging.getLogger("collector")
 
@@ -391,8 +391,10 @@ def write_daily_snapshot(
     """
     n = 0
     bad_price = 0
+    stale_quote = 0
+    no_time = 0
     fallback: dict[str, int] = {}
-    now_ts = int(time.time())
+    row_day = datetime.strptime(date, "%Y-%m-%d").date()
     for blk in blocks:
         name = blk.get("marketHashName")
         row = pick_platform(blk, prefer)
@@ -405,7 +407,32 @@ def write_daily_snapshot(
         plat = str(row.get("platform") or "?")
         if plat != prefer:
             fallback[plat] = fallback.get(plat, 0) + 1
-        quote_ts = int(row.get("updateTime") or now_ts)
+
+        # ⚠️ 来源时间必须如实使用，**不能**用本机时间顶替（审查发现）：
+        # updateTime 缺失时写本机当前时间，等于凭空给这条报价盖一个"刚刚观测"的章，
+        # 新鲜度闸门（按观测时间判断）就会放行一条观测时间未知的数据。
+        # 所以缺失就留空 —— 宁可承认"不知道"，也不制造虚假的新鲜度。
+        raw_ts = row.get("updateTime")
+        try:
+            quote_ts = int(raw_ts) if raw_ts else None
+        except (TypeError, ValueError):
+            quote_ts = None
+        if quote_ts is None:
+            no_time += 1
+
+        # ⚠️ 陈旧报价**不许写进历史**（审查发现）：观测时间比入库日期早太多的报价，
+        # 如果照样按"今天"的行写进去，就会：
+        #   1) 让训练集里出现一堆"日期是新的、价格是旧的"样本（污染特征与标签）；
+        #   2) 让 is_warm 被这些假样本喂饱，截面看起来是预热过的。
+        # 只拦最后一行是不够的 —— 必须在**入历史之前**就挡掉。
+        # 价格序列的权威来源仍是 K 线通道（每个交易日一根 bar，戳就是那天），
+        # 所以挡掉陈旧快照不会让冷门品种丢价格。
+        if quote_ts is not None:
+            obs_day = datetime.fromtimestamp(quote_ts, tz=BEIJING).date()
+            if (row_day - obs_day).days > CFG.quote_max_age_days:
+                stale_quote += 1
+                continue
+
         cnt = _valid_count(row.get("sellCount"))
         con.execute(
             SNAP_UPSERT_QUOTE,   # 不是 INSERT OR REPLACE，也不是无比较的 UPSERT
@@ -429,6 +456,14 @@ def write_daily_snapshot(
         )
         n += 1
     con.commit()
+    if stale_quote:
+        log.warning("跳过 %d 条陈旧报价（观测时间比入库日期早 %d 天以上）—— "
+                    "这些行情如果按今天写进去，会污染训练集（日期新、价格旧）"
+                    "并让 is_warm 看着像是预热过的；价格序列仍由 K 线通道保证",
+                    stale_quote, CFG.quote_max_age_days)
+    if no_time:
+        log.warning("有 %d 条响应没有 updateTime：观测时间按「未知」处理（不伪造本机时间）",
+                    no_time)
     if bad_price:
         log.warning("丢弃 %d 条无效报价的**价格**（sellPrice 非正 / 非有限，已置空），"
                     "但保留其挂单量 —— 静默写入会让它在特征里变成 -100%% 暴跌", bad_price)
@@ -931,11 +966,18 @@ def latest_listings(con: sqlite3.Connection, items: list[str] | None = None) -> 
         params = list(items)
 
     df = pd.read_sql_query(
+        # ⚠️ 选「最新**观测**」，不是「最新**行**」（审查发现）：
+        # 原先用 MAX(date) 挑行，于是「昨天观测到挂单量 0、今天收到一条观测时间更旧的
+        # 缓存数量 100」时，会选中今天那行旧缓存，再因为过期被判成"不知道"而放行 ——
+        # 昨天那条**仍然有效**的 0 反而被丢掉了。
+        # 所以排序键用 count_ts（没有 count_ts 的老行退回入库日期）。
         "SELECT s.item_id, s.listings, s.date AS listings_date, s.count_ts "
         "  FROM snap s "
-        "  JOIN (SELECT item_id, MAX(date) AS d FROM snap "
-        "         WHERE listings IS NOT NULL GROUP BY item_id) m "
-        "    ON m.item_id = s.item_id AND m.d = s.date "
+        "  JOIN (SELECT item_id,"
+        "               MAX(COALESCE(count_ts, CAST(strftime('%s', date) AS INTEGER))) AS k"
+        "          FROM snap WHERE listings IS NOT NULL GROUP BY item_id) m "
+        "    ON m.item_id = s.item_id "
+        "   AND COALESCE(s.count_ts, CAST(strftime('%s', s.date) AS INTEGER)) = m.k "
         " WHERE " + " AND ".join(conds),
         con,
         params=params,

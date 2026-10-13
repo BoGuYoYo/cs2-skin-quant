@@ -122,6 +122,13 @@ class Cfg:
     #: 活跃品种的行情日期就是今天，漏跑一天也不至于把它们全丢掉。
     infer_max_age_days: int = field(default_factory=lambda: _i("INFER_MAX_AGE_DAYS", 3))
 
+    #: 快照报价的最大允许年龄：观测时间比入库日期早这么多天的报价**不写进历史**。
+    #: 光在推理前拦是不够的（审查发现）：一条 09-29 的老报价按 10-13 写进去之后，
+    #: 会变成"日期是新的、价格是旧的"训练样本，还会把 is_warm 喂饱，
+    #: 让截面看着像是预热过的。价格序列的权威来源是 K 线通道
+    #: （每个交易日一根 bar，戳就是那天），所以挡掉陈旧快照不会让冷门品种丢价格。
+    quote_max_age_days: int = field(default_factory=lambda: _i("QUOTE_MAX_AGE_DAYS", 3))
+
     def ensure_dirs(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
 

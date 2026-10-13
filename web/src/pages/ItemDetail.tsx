@@ -112,7 +112,7 @@ export default function ItemDetail() {
           <State loading={detail.loading} error={detail.error}>
             {fc?.stale ? (
               <div className="t-warn" style={{ fontSize: 12, marginBottom: 8 }}>
-                ⚠️ {fc.staleReason ?? '这是历史预测'}（数据日 {fc.date}）。下面的数值不是当前建议。
+                ⚠️ {fc.staleReason ?? '这是历史预测'}。下面的数值不是当前建议。
               </div>
             ) : null}
             <QuantileBand q10={fc?.q10_adj ?? null} q50={fc?.q50 ?? null} q90={fc?.q90_adj ?? null} />

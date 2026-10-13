@@ -576,7 +576,7 @@ def test_listings_cross_midnight_and_stale_guard() -> None:
         seq = [_dt(2026, 10, 11, 23, 59), _dt(2026, 10, 11, 23, 59), _dt(2026, 10, 12, 0, 1)]
         real_dt, real_fetch = collector.datetime, collector.fetch_prices
 
-        class _FakeDT:
+        class _FakeDT(_dt):     # 继承真 datetime：只替换 now()，其余类方法照常可用
             @staticmethod
             def now():
                 return seq.pop(0) if seq else _dt(2026, 10, 12, 0, 2)
@@ -585,7 +585,9 @@ def test_listings_cross_midnight_and_stale_guard() -> None:
         collector.fetch_prices = lambda chunk, *a, **kw: [   # type: ignore[assignment]
             {"marketHashName": n,
              "dataList": [{"platform": "BUFF", "sellPrice": 9.9, "sellCount": 30,
-                           "updateTime": 3_000_000}]}
+                           # updateTime 必须与"当天"接近：写入端会拒收陈旧报价
+                           "updateTime": int(_dt(2026, 10, 11, 12, 0,
+                                                 tzinfo=timezone.utc).timestamp())}]}
             for n in chunk
         ]
         try:
@@ -839,6 +841,10 @@ def test_invalid_quotes_rejected_and_src_filtered() -> None:
     print("\n[25] 报价校验与平台口径")
     import tempfile  # noqa: PLC0415
 
+    from pipeline.config import BEIJING as _BJ  # noqa: PLC0415
+
+    today = datetime.now(_BJ).strftime("%Y-%m-%d")   # 与"刚刚观测"的时间戳保持同一口径
+
     check("正常价格通过", collector._valid_price(12.5))
     check("0 被拒（否则就是一根 −100% 暴跌）", not collector._valid_price(0))
     check("负数被拒", not collector._valid_price(-3))
@@ -852,14 +858,17 @@ def test_invalid_quotes_rejected_and_src_filtered() -> None:
         con = collector.connect(Path(td) / "q.db")
 
         def blk(name: str, price, plat: str = "BUFF", cnt=30) -> dict:
+            # updateTime 用"现在"：写入端现在会拒收「观测时间比入库日期早太多」的
+            # 陈旧报价，用 1970 年那种假值会整批被拦（这正是新一轮加的保护）。
             return {"marketHashName": name,
                     "dataList": [{"platform": plat, "sellPrice": price,
-                                  "sellCount": cnt, "updateTime": 3_000_000}]}
+                                  "sellCount": cnt,
+                                  "updateTime": int(datetime.now(_BJ).timestamp())}]}
 
         n = collector.write_daily_snapshot(con, [
             blk("A", 12.5), blk("B", 0), blk("C", -5), blk("D", float("nan")),
             blk("E", 8.0, plat="YOUPIN"),
-        ], "2026-10-13")
+        ], today)
         rows = dict(con.execute("SELECT item_id, sell FROM snap"))
         check("无效价格写成 NULL（价格绝不落在序列里）",
               rows.get("B") is None and rows.get("C") is None and rows.get("D") is None,
@@ -870,7 +879,7 @@ def test_invalid_quotes_rejected_and_src_filtered() -> None:
               cnt.get("B") == 30, f"{cnt}")
 
         # 审查给的场景：sellPrice=0 且 sellCount=0（当前无人挂售）
-        collector.write_daily_snapshot(con, [blk("Z", 0, cnt=0)], "2026-10-13")
+        collector.write_daily_snapshot(con, [blk("Z", 0, cnt=0)], today)
         z = con.execute("SELECT sell, listings FROM snap WHERE item_id='Z'").fetchone()
         check("零报价品种：价格 NULL，但挂单量记成 0（闸门可判定为「已知为 0」而不是「不知道」）",
               z[0] is None and z[1] == 0, f"{tuple(z)}")
@@ -1224,6 +1233,10 @@ def test_count_ts_requires_an_actual_count() -> None:
     print("\n[34] 空数量观测不许推进时间戳")
     import tempfile  # noqa: PLC0415
 
+    from pipeline.config import BEIJING as _BJ  # noqa: PLC0415
+
+    today = datetime.now(_BJ).strftime("%Y-%m-%d")
+
     with tempfile.TemporaryDirectory() as td:
         con = collector.connect(Path(td) / "cts2.db")
         con.execute(collector.SNAP_UPSERT_QUOTE,
@@ -1244,8 +1257,9 @@ def test_count_ts_requires_an_actual_count() -> None:
 
         collector.write_daily_snapshot(con, [
             {"marketHashName": "NOCNT",
-             "dataList": [{"platform": "BUFF", "sellPrice": 9.9, "updateTime": 5000}]},
-        ], "2026-10-13")
+             "dataList": [{"platform": "BUFF", "sellPrice": 9.9,
+                           "updateTime": int(datetime.now(_BJ).timestamp())}]},
+        ], today)
         got = con.execute("SELECT listings, count_ts FROM snap WHERE item_id='NOCNT'").fetchone()
         check("响应没有挂单量时 count_ts 记 NULL（不宣称观测过）",
               got[0] is None and got[1] is None, f"{tuple(got)}")
@@ -1280,13 +1294,18 @@ def test_expired_listings_not_reused_by_anomaly() -> None:
 
 
 def test_stale_forecast_marked_on_detail_page() -> None:
-    """[P2] 无截面时，单品详情页不许再把旧预测当当前建议。"""
+    """[P2] 无截面时，单品详情页不许再把旧预测当当前建议。
+
+    判据必须**按单品**：最近一次运行整体成功、但这个品种被闸门剔掉时，
+    它的预测还停在昨天 —— 只看全局「今天无截面」标记是抓不到的。
+    """
     print("\n[36] 详情页的历史预测必须标注")
     api_src = (SERVER / "app.py").read_text(encoding="utf-8")
-    check("后端给历史预测打 stale 标记",
-          'fc_dict["stale"]' in api_src and "no_cross_section_on" in api_src)
-    check("stale 判定要求「预测日期早于最近一次运行」",
-          'str(fc_dict.get("date")) < last_run' in api_src)
+    check("后端给历史预测打 stale 标记", 'fc_dict["stale"]' in api_src)
+    check("stale 判据是「预测日期早于最近一次运行」",
+          'str(fc_dict.get("date") or "") < last_run' in api_src)
+    check("不再只看全局 no_cross_section 标记",
+          'marker and marker == last_run' not in api_src)
 
     web = SERVER.parent / "web" / "src"
     ts = (web / "lib" / "api.ts").read_text(encoding="utf-8")
@@ -1294,6 +1313,82 @@ def test_stale_forecast_marked_on_detail_page() -> None:
     page = (web / "pages" / "ItemDetail.tsx").read_text(encoding="utf-8")
     check("详情页对 stale 预测显示提示而不是买入标签",
           "fc?.stale" in page and "非当前建议" in page)
+
+
+def test_stale_quote_never_enters_history() -> None:
+    """[P1] 陈旧报价必须在**入历史之前**就被挡掉。
+
+    审查给的复现：同一笔旧报价连续写到不同日期，于是生成一堆成熟且已预热的
+    训练样本（日期是新的、价格是旧的）；最后补一条新报价，最新截面也能通过预热检查。
+    只在推理前拦最后一行是不够的 —— 特征与标签都是按入库日期算的。
+    """
+    print("\n[37] 陈旧报价不许写进历史")
+    import tempfile  # noqa: PLC0415
+    from datetime import datetime as _dt  # noqa: PLC0415
+    from datetime import timedelta as _td  # noqa: PLC0415
+
+    from pipeline.config import BEIJING as _BJ  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "stale.db")
+        now = _dt.now(_BJ)
+        old_ts = int((now - _td(days=30)).timestamp())
+
+        def blk(name: str, ts) -> dict:
+            d = {"platform": "BUFF", "sellPrice": 50.0, "sellCount": 30}
+            if ts is not None:
+                d["updateTime"] = ts
+            return {"marketHashName": name, "dataList": [d]}
+
+        # 连续三天都用同一笔 30 天前的旧报价 → 一行都不该写进去
+        written = 0
+        for off in (0, -1, -2):
+            day = (now + _td(days=off)).strftime("%Y-%m-%d")
+            written += collector.write_daily_snapshot(con, [blk("OLD", old_ts)], day)
+        rows = con.execute("SELECT COUNT(*) FROM snap WHERE item_id='OLD'").fetchone()[0]
+        check("陈旧报价一行都没进历史（不会造出「日期新、价格旧」的训练样本）",
+              rows == 0, f"写入 {written} 条，库里 {rows} 行")
+
+        # 新鲜报价照常写入
+        collector.write_daily_snapshot(con, [blk("NEW", int(now.timestamp()))],
+                                       now.strftime("%Y-%m-%d"))
+        n_new = con.execute("SELECT COUNT(*) FROM snap WHERE item_id='NEW'").fetchone()[0]
+        check("新鲜报价正常写入", n_new == 1, f"{n_new}")
+
+        # 没有 updateTime → 不许伪造本机时间
+        collector.write_daily_snapshot(con, [blk("NOTIME", None)], now.strftime("%Y-%m-%d"))
+        got = con.execute("SELECT ts, count_ts FROM snap WHERE item_id='NOTIME'").fetchone()
+        check("来源时间缺失时保留为「未知」，不伪造本机时间",
+              got[0] is None and got[1] is None, f"{tuple(got)}")
+        con.close()
+
+
+def test_latest_listings_picks_newest_observation() -> None:
+    """[P2] 最新挂单量要按 count_ts 选，不能按入库日期选行。
+
+    审查给的场景：昨天观测到 0，今天收到一条观测时间更旧的缓存数量 100 ——
+    按 MAX(date) 会选中今天那条旧缓存，再因过期被判成「不知道」而放行，
+    把昨天那条**仍然有效**的 0 丢掉。
+    """
+    print("\n[38] 挂单量按观测时间选最新")
+    import tempfile  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "lst.db")
+        # 用真实量级的时间戳，顺便让 listings_obs_date 也是正常日期
+        t_yday = int(datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc).timestamp())
+        t_cached = int(datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc).timestamp())
+        # 昨天：观测时间较新、数量 0
+        con.execute(collector.SNAP_UPSERT_QUOTE,
+                    ("X", "2026-10-12", 11.0, 11.0, 0, None, None, t_yday, "BUFF", t_yday))
+        # 今天：行日期更新，但观测时间更旧、数量 100
+        con.execute(collector.SNAP_UPSERT_QUOTE,
+                    ("X", "2026-10-13", None, None, 100, None, None, None, None, t_cached))
+        con.commit()
+        lst = collector.latest_listings(con, ["X"]).iloc[0]
+        check("选中观测时间最新的那条（昨天的 0，而不是今天的旧缓存 100）",
+              int(lst["listings"]) == 0 and int(lst["count_ts"]) == t_yday, f"{dict(lst)}")
+        con.close()
 
 
 def main() -> int:
@@ -1336,6 +1431,8 @@ def main() -> int:
     test_count_ts_requires_an_actual_count()
     test_expired_listings_not_reused_by_anomaly()
     test_stale_forecast_marked_on_detail_page()
+    test_stale_quote_never_enters_history()
+    test_latest_listings_picks_newest_observation()
     print("\n" + "=" * 62)
     if FAIL:
         print(f"结果：{len(FAIL)} 项失败 → {FAIL}")

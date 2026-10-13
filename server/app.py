@@ -312,22 +312,28 @@ def item_detail(item_id: str) -> dict[str, Any]:
         forecast = con.execute(
             "SELECT * FROM forecast WHERE item_id = ? ORDER BY date DESC LIMIT 1", (item_id,)
         ).fetchone()
-        # 「最近一次运行没有产生有效截面」时，这条历史预测属于**旧建议**，
-        # 不能当成当前结论展示（审查发现：候选列表已经返回空，
-        # 但单品详情页仍然照旧返回昨天的 side=buy）。
-        # 历史记录保留，只是明确标注为历史。
+        # ⚠️ 判断「这条预测还算不算当前建议」要**按单品**看，不能只看全局失败标记
+        # （审查发现）：最近一次运行可能整体成功，但这个品种被流动性闸门剔掉了 ——
+        # 它的 factor_latest 已被清理，预测却还停在昨天，详情页照样显示 side=buy。
+        #
+        # 判据：预测日期 < 最近一次运行的日期（meta.last_run）。
+        #   - 全局无截面：本来就清掉了今天的预测 → 历史预测 < last_run ✓
+        #   - 单品被淘汰：今天没给它写预测 → 它最后一条仍然 < last_run ✓
+        #   - 正常入选：预测日期 == last_run → 不算过期 ✓
         try:
             meta = {r["k"]: r["v"] for r in con.execute("SELECT k, v FROM meta")}
         except sqlite3.Error:
             meta = {}
-        marker = meta.get("no_cross_section_on") or ""
+        last_run = meta.get("last_run") or ""
         fc_dict = dict(forecast) if forecast else None
         if fc_dict is not None:
-            last_run = meta.get("last_run") or ""
-            fc_dict["stale"] = bool(marker and marker == last_run
-                                    and str(fc_dict.get("date")) < last_run)
-            fc_dict["staleReason"] = ("最近一次运行没有产生有效截面，这条是历史预测"
-                                      if fc_dict["stale"] else None)
+            stale = bool(last_run and str(fc_dict.get("date") or "") < last_run)
+            fc_dict["stale"] = stale
+            fc_dict["staleReason"] = (
+                f"这条预测的数据日 {fc_dict.get('date')} 早于最近一次运行（{last_run}）"
+                f" —— 该品种不在当前截面里（被流动性闸门剔除 / 行情太旧 / 数据不足），"
+                f"下面是历史值，不代表当前建议"
+            ) if stale else None
         kase = con.execute(
             """SELECT cm.* FROM case_meta cm JOIN items i ON i.case_id = cm.case_id
                 WHERE i.item_id = ?""",
