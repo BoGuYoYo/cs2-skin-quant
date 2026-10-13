@@ -15,7 +15,7 @@ import math
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
@@ -48,8 +48,27 @@ log = logging.getLogger("daily")
 
 
 # ------------------------------------------------------------------ 工具
+#: 全系统统一用北京时间归日。
+#:
+#: 踩过的坑：这里原先用 UTC 日期（datetime.now(timezone.utc)），而
+#:   1) K 线入库是按北京时间归日的（ts + 8h），
+#:   2) 挂单量采集用的是本机时间（也是北京），
+#:   3) 定时器设在**北京 07:00**（= UTC 次日 23:00）——
+#: 三件事凑在一起就错位：07:00 那次任务算出来的 day 是**昨天**。
+#: 实测：08:42 完成的 07:00 任务把 day 写成 2026-10-11，于是
+#:   看板的「基准日」整整一天都慢一天，直到 19:00 那次才出现 10-12；
+#:   而且 forecast 按 day 做 replace_date，等于把前一天的快照覆盖掉了。
+#: batch 采集模式更糟：报价会直接写进前一天的价格行。
+BEIJING = timezone(timedelta(hours=8))
+
+
 def today_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return datetime.now(BEIJING).strftime("%Y-%m-%d")
+
+
+def day_start_ts(day: str) -> int:
+    """某天（北京）零点的 epoch —— 用于「清理今日旧告警」这类按天划界的操作"""
+    return int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=BEIJING).timestamp())
 
 
 def load_watchlist(con) -> list[str]:
@@ -558,8 +577,10 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
 
     # alerts 是自增主键，同一天重跑会不断叠加（实测演示数据里同一条 L3 出现了 3 次）。
     # 日线策略一天一份快照，所以推送前先清掉当天的旧记录。
+    # 「今天」按北京零点划界 —— day 现在就是北京日期，别再当 UTC 解释
+    # （原先 replace(tzinfo=utc) 会把这 8 小时算错，跨零点的告警清不掉）。
     try:
-        day_start = int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+        day_start = day_start_ts(day)
         n_del = con.execute("DELETE FROM alerts WHERE ts >= ?", (day_start,)).rowcount
         con.commit()
         if n_del:
@@ -601,23 +622,48 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
         fails.append(f"推送失败: {e}")
         log.error("推送失败：%s", e)
 
+    # factor_latest 是「当前截面」表，不是历史表。
+    # 本轮没入选的品种（被流动性闸门剔掉 / 被域筛选排除 / 本轮没数据）如果留着旧行，
+    # 页面会拿旧价格当现价展示 —— 而 /api/screener 只按 price 和 rarity 过滤、
+    # **不看日期**，所以这些旧行一定会露出来。
+    # 实测：修之前积了 10,732 行 10-11 的旧行，而当前池子只有 5,435 个品种，
+    # 也就是说筛选页里三分之二的条目是不该再出现的。
+    try:
+        n_stale = con.execute("DELETE FROM factor_latest WHERE date <> ?", (day,)).rowcount
+        con.commit()
+        if n_stale:
+            log.info("清理 factor_latest 陈旧行 %d 条（本轮未入选的品种不再展示）", n_stale)
+    except Exception as e:
+        log.warning("清理 factor_latest 陈旧行失败：%s", e)
+
     # ---------------- 7. 通知 ----------------
     if candidates:
         notify.notify_digest(day, candidates, fails or None)
 
-    # 告警通知：带上真实现价（原先写死 0.0，推送到手机上永远是「现价 ¥0.00」）
+    # 告警通知：先按等级筛 + 按分数排序，**最后**才限量。
+    # 踩过的坑：原先写法是 `for a in alert_rows[:5]: if a["level"] == "L3"` ——
+    # alert_rows 是按品种遍历顺序追加的（与严重程度无关），于是前 5 条里
+    # 常常一条 L3 都没有。实测那一刻库里 L3 有 235 条，前 5 条是
+    # [L2, L3, L3, L2, L3]，只推出去了 3 条；换个顺序就可能一条都不推。
+    # 顺序必须是：筛等级 → 按分数降序 → 取前 N。其余留在看板上。
     price_by_item = {
         r["item_id"]: r["price"]
         for r in factor_rows
         if r.get("item_id") and r.get("price") is not None
     }
-    for a in alert_rows[:5]:
-        if a["level"] == "L3":
-            notify.notify_item(
-                a["name"] or a["item_id"], a["level"],
-                float(price_by_item.get(a["item_id"]) or 0.0),
-                a["detail"] or "",
-            )
+    l3_alerts = sorted(
+        (a for a in alert_rows if a["level"] == "L3"),
+        key=lambda x: -float(x.get("score") or 0.0),
+    )
+    if l3_alerts:
+        log.info("L3 告警 %d 条，按分数取前 %d 条推送（其余留在看板）",
+                 len(l3_alerts), min(len(l3_alerts), cfg.alert_push_max))
+    for a in l3_alerts[: cfg.alert_push_max]:
+        notify.notify_item(
+            a["name"] or a["item_id"], a["level"],
+            float(price_by_item.get(a["item_id"]) or 0.0),
+            a["detail"] or "",
+        )
 
     _print_top(candidates)
     return 0 if not fails else 6

@@ -547,6 +547,135 @@ def test_source_guards_for_fixed_bugs() -> None:
         check(f"死代码已移除：{name}", name not in allsrc)
 
 
+def test_listings_cross_midnight_and_stale_guard() -> None:
+    """[P1] 常驻采集跨日必须换日期；[P1] 旧报价不许覆盖新报价。"""
+    print("\n[18] 采集跨日与新旧比较")
+    import tempfile  # noqa: PLC0415
+    from datetime import datetime as _dt  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "x.db")
+        cols = {r[1] for r in con.execute("PRAGMA table_info(snap)")}
+        check("snap 有 src 列（记录行情来源平台 / kline）", "src" in cols, f"{sorted(cols)}")
+
+        def put(day: str, price: float, ts: int, plat: str = "BUFF") -> None:
+            con.execute(collector.SNAP_UPSERT_QUOTE,
+                        ("X", day, price, price, 10, None, None, ts, plat))
+            con.commit()
+
+        put("2026-10-12", 100.0, 2_000_000)
+        put("2026-10-12", 50.0, 1_000_000)      # 更旧的报价 → 必须被拒
+        got = con.execute("SELECT sell FROM snap WHERE item_id='X'").fetchone()[0]
+        check("更旧的报价不能覆盖更新的", got == 100.0, f"sell={got}")
+        put("2026-10-12", 120.0, 3_000_000)     # 更新的报价 → 生效
+        got = con.execute("SELECT sell FROM snap WHERE item_id='X'").fetchone()[0]
+        check("更新的报价正常写入", got == 120.0, f"sell={got}")
+
+        # 跨午夜：启动时 10-11 23:59，第 2 批已到 10-12 00:01
+        seq = [_dt(2026, 10, 11, 23, 59), _dt(2026, 10, 11, 23, 59), _dt(2026, 10, 12, 0, 1)]
+        real_dt, real_fetch = collector.datetime, collector.fetch_prices
+
+        class _FakeDT:
+            @staticmethod
+            def now():
+                return seq.pop(0) if seq else _dt(2026, 10, 12, 0, 2)
+
+        collector.datetime = _FakeDT        # type: ignore[assignment]
+        collector.fetch_prices = lambda chunk, *a, **kw: [   # type: ignore[assignment]
+            {"marketHashName": n,
+             "dataList": [{"platform": "BUFF", "sellPrice": 9.9, "sellCount": 30,
+                           "updateTime": 3_000_000}]}
+            for n in chunk
+        ]
+        try:
+            stats = collector.collect_listings(con, None, "k", ["A", "B", "C", "D"],
+                                               interval=0, max_batches=2)  # type: ignore[arg-type]
+        finally:
+            collector.datetime, collector.fetch_prices = real_dt, real_fetch  # type: ignore[assignment]
+
+        days = dict(con.execute(
+            "SELECT date, COUNT(*) FROM snap WHERE item_id IN ('A','B','C','D') GROUP BY date"))
+        check("跨午夜后第 2 批写到新日期，不复用启动日期",
+              days.get("2026-10-11") == 4 and days.get("2026-10-12") == 4, f"{days}")
+        check("stats['day'] 同步更新", stats.get("day") == "2026-10-12", f"{stats.get('day')}")
+        con.close()
+
+
+def test_kline_validation_and_source() -> None:
+    """[P2] K 线必须过自洽性/有限性校验，并记录来源。"""
+    print("\n[19] K 线自洽性校验")
+    import tempfile  # noqa: PLC0415
+
+    check("合法 bar 通过", collector._ohlc_ok(100, 108, 98, 105))
+    check("h < max(o,c) 被拒", not collector._ohlc_ok(100, 101, 98, 105))
+    check("l > min(o,c) 被拒", not collector._ohlc_ok(100, 108, 104, 105))
+    check("NaN 被拒（float('nan') 不抛异常，原先会原样入库）",
+          not collector._ohlc_ok(100, float("nan"), 98, 105))
+    check("inf 被拒", not collector._ohlc_ok(100, float("inf"), 98, 105))
+    check("非正数被拒", not collector._ohlc_ok(-1.0, 1.0, 1.0, 1.0))
+
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "k.db")
+        n = collector.write_kline_rows(con, "T", [
+            [1760198400, 100.0, 105.0, 108.0, 98.0],          # 合法
+            [1760284800, 100.0, 105.0, 99.0, 98.0],           # h=99 < max(100,105) 矛盾
+            [1760371200, float("nan"), 105.0, 108.0, 98.0],   # NaN
+        ])
+        check("只写入合法的那一条", n == 1, f"n={n}")
+        rows = tuple(con.execute(
+            "SELECT COUNT(*), COUNT(src) FROM snap WHERE item_id='T'").fetchone())
+        check("不合格 bar 没落库，src 已记录", rows == (1, 1), f"{rows}")
+        check("kline 表同样只留合法行",
+              con.execute("SELECT COUNT(*) FROM kline WHERE item_id='T'").fetchone()[0] == 1)
+        con.close()
+
+
+def test_cross_section_from_single_row() -> None:
+    """[P2] 最新截面必须整行取自同一天，不能逐列各取最后非空值。
+
+    当时症状：groupby().last() 是逐列取最后一个非空值，会把「前几天有、
+    今天没有」的挂单量拼到今天的新价格上 —— 而流动性闸门正好读 listings。
+    """
+    print("\n[20] 最新截面必须来自同一行")
+    df = pd.DataFrame([
+        {"item_id": "A", "date": pd.Timestamp("2026-10-11"), "price": 10.0, "listings": 50},
+        {"item_id": "A", "date": pd.Timestamp("2026-10-12"), "price": 12.0, "listings": None},
+        {"item_id": "B", "date": pd.Timestamp("2026-10-12"), "price": 5.0, "listings": 7},
+    ])
+    out = features.latest_cross_section(df).set_index("item_id")
+    check("今天没有挂单量就是 NaN（不拿前几天的顶上）",
+          bool(pd.isna(out.loc["A", "listings"])), f"{out.loc['A', 'listings']}")
+    check("价格与日期来自同一行",
+          float(out.loc["A", "price"]) == 12.0
+          and str(out.loc["A", "date"])[:10] == "2026-10-12",
+          f"{out.loc['A', 'price']} @ {out.loc['A', 'date']}")
+    check("有数据的品种正常取最后一行", int(out.loc["B", "listings"]) == 7)
+
+
+def test_beijing_day_and_notification_order() -> None:
+    """[P2] 基准日必须是北京时间；[P2] 告警先筛等级再限量；[P1] 清理陈旧因子。"""
+    print("\n[21] 北京基准日 / 通知顺序 / 陈旧因子清理")
+    from datetime import datetime as _dt  # noqa: PLC0415
+    from datetime import timedelta as _td  # noqa: PLC0415
+    from datetime import timezone as _tz  # noqa: PLC0415
+
+    from pipeline import run_daily as rd  # noqa: PLC0415
+
+    bj = (_dt.now(_tz.utc) + _td(hours=8)).strftime("%Y-%m-%d")
+    check("today_str() 返回北京日期", rd.today_str() == bj, f"{rd.today_str()} vs 北京 {bj}")
+
+    src = (SERVER / "pipeline" / "run_daily.py").read_text(encoding="utf-8")
+    # 去掉注释行再查：那条踩坑注释里**故意**保留着旧写法的原文（记录事故现场），
+    # 直接全文匹配会误报。
+    src_code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("#"))
+    check("today_str 不再用 UTC 日期", "now(timezone.utc).strftime" not in src_code)
+    check("factor_latest 陈旧行有清理机制",
+          "DELETE FROM factor_latest WHERE date <> ?" in src_code)
+    check("告警不再「先截前 5 条再筛 L3」", "alert_rows[:5]" not in src_code)
+    check("L3 先按分数排序再限量", "l3_alerts[: cfg.alert_push_max]" in src_code)
+    check("限量阈值进了配置", CFG.alert_push_max >= 1, f"alert_push_max={CFG.alert_push_max}")
+
+
 def main() -> int:
     print("=" * 62)
     print("回归测试：每条对应一个真实踩过的坑")
@@ -568,6 +697,10 @@ def main() -> int:
     test_meta_table_and_cursor()
     test_notify_digest_uses_simple_returns()
     test_source_guards_for_fixed_bugs()
+    test_listings_cross_midnight_and_stale_guard()
+    test_kline_validation_and_source()
+    test_cross_section_from_single_row()
+    test_beijing_day_and_notification_order()
     print("\n" + "=" * 62)
     if FAIL:
         print(f"结果：{len(FAIL)} 项失败 → {FAIL}")

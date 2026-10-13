@@ -225,5 +225,19 @@ def build(
 
 
 def latest_cross_section(df: pd.DataFrame) -> pd.DataFrame:
-    """取每个 item 的最后一行 —— 推理只用这一行"""
-    return df.sort_values("date").groupby("item_id", as_index=False).last()
+    """取每个品种的**最后一行**（整行取，不是逐列取最后一个非空值）。
+
+    踩过的坑：原先写的是 df.sort_values("date").groupby("item_id").last() ——
+    DataFrameGroupBy.last() 是**逐列**各取最后一个非空值，于是会把
+    「前几天有、今天没有」的挂单量拼到今天的新价格上，连 date 列都可能
+    来自另一行。表面上是「最新截面」，实际是多个日期的字段缝合怪。
+    新加上来的流动性闸门正好读 listings，会被这个截面直接坑到
+    （拿前几天的挂单量去判断今天的流动性）。
+
+    整行取之后：今天没更新到的品种，那一行就是 NaN —— 闸门按「不知道就放行」
+    处理（见 run_daily._apply_liquidity_gate），这才是诚实的。
+    """
+    if df.empty:
+        return df
+    last = df.sort_values("date").groupby("item_id", as_index=False).tail(1)
+    return last.reset_index(drop=True)

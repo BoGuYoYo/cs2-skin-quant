@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS case_meta (
 CREATE TABLE IF NOT EXISTS snap (
   item_id TEXT, date TEXT, sell REAL, bid REAL,
   listings INTEGER, volume INTEGER, supply INTEGER, ts INTEGER,
+  src TEXT,
   PRIMARY KEY (item_id, date)
 );
 CREATE INDEX IF NOT EXISTS ix_snap ON snap(item_id, date);
@@ -87,19 +89,46 @@ def _upsert_sql(table: str, cols: list[str], pk: list[str]) -> str:
     )
 
 
-#: snap 专用：用 COALESCE 让 NULL 不覆盖已有值。
-#: kline 采集只提供价格，batch 采集会补 listings —— 两者必须能共存而不是互相清空。
+#: snap 专用（K 线通道）：用 COALESCE 让 NULL 不覆盖已有值。
+#: K 线只提供价格，batch 采集会补 listings —— 两者必须能共存而不是互相清空。
+#: 这一条**不加新旧比较**：K 线是「某个日期的权威日线」，它来收尾就该允许覆盖
+#: （例如次日 07:00 用它把昨天那根未封口的 bar 定稿）。
 SNAP_UPSERT = """
-INSERT INTO snap (item_id, date, sell, bid, listings, volume, supply, ts)
-VALUES (?,?,?,?,?,?,?,?)
+INSERT INTO snap (item_id, date, sell, bid, listings, volume, supply, ts, src)
+VALUES (?,?,?,?,?,?,?,?,?)
 ON CONFLICT(item_id, date) DO UPDATE SET
   sell     = COALESCE(excluded.sell,     snap.sell),
   bid      = COALESCE(excluded.bid,      snap.bid),
   listings = COALESCE(excluded.listings, snap.listings),
   volume   = COALESCE(excluded.volume,   snap.volume),
   supply   = COALESCE(excluded.supply,   snap.supply),
-  ts       = COALESCE(excluded.ts,       snap.ts)
+  ts       = COALESCE(excluded.ts,       snap.ts),
+  src      = COALESCE(excluded.src,      snap.src)
 """
+
+#: snap 专用（快照/挂单量通道）：**必须比较新旧**。
+#:
+#: 踩过的坑：原先两条通道共用无比较的 UPSERT，于是「后写者胜出」——
+#: 一批 5 分钟前抓到的报价，可以把刚写进去的新价盖回旧值。
+#: 而且 batch 原先不写响应里的 updateTime（用的是本机写入时刻），
+#: 连「谁更新」都无从判断。现在 batch 写 updateTime，并且旧的不许覆盖新的。
+SNAP_UPSERT_QUOTE = SNAP_UPSERT.rstrip() + """
+WHERE excluded.ts IS NULL OR snap.ts IS NULL OR excluded.ts >= snap.ts
+"""
+
+
+def _migrate(con: sqlite3.Connection) -> None:
+    """给**已存在的库**补上后来新增的列。
+
+    ⚠️ 只改 SCHEMA 里的 CREATE TABLE 对老库完全无效
+    （CREATE TABLE IF NOT EXISTS 见表就什么都不做），新代码写新列会直接
+    抛 no such column。所以新增列必须同时写在这里。
+    """
+    have = {r[1] for r in con.execute("PRAGMA table_info(snap)")}
+    if "src" not in have:
+        con.execute("ALTER TABLE snap ADD COLUMN src TEXT")
+        con.commit()
+        log.info("snap 补列：src（记录这条行情来自哪个平台 / kline）")
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -111,6 +140,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     con.execute("PRAGMA synchronous=NORMAL")
     con.execute("PRAGMA busy_timeout=60000")
     con.executescript(SCHEMA)
+    _migrate(con)
     con.commit()
     return con
 
@@ -204,27 +234,51 @@ def fetch_base(api_key: str) -> list[dict[str, Any]]:
 
 
 def pick_platform(block: dict[str, Any], prefer: str = "BUFF") -> dict[str, Any] | None:
-    """统一口径：全系统只用同一个平台的底价做主序列，避免混口径造成人工暴跌。"""
+    """统一口径：全系统只用同一个平台的底价做主序列，避免混口径造成人工暴跌。
+
+    ⚠️ 回退是**例外**，不是常态：BUFF 缺失时取最低价平台，但调用方必须
+    把真实平台记进 snap.src 并告警（见 write_daily_snapshot）——
+    否则同一列 sell 里悄悄混进别的平台，价格序列会凭空跳一下，
+    而这种跳变在特征里看不出任何异常，只会被当成「行情异动」。
+    """
     rows = block.get("dataList") or []
     if not rows:
         return None
     for r in rows:
         if r.get("platform") == prefer:
             return r
-    # 退而求其次：取最低价平台
     return min(rows, key=lambda x: x.get("sellPrice") or 9e9)
 
 
-def write_daily_snapshot(con: sqlite3.Connection, blocks: Iterable[dict[str, Any]], date: str) -> int:
-    """写入当日快照。同一天重复跑会覆盖（幂等）。"""
+def write_daily_snapshot(
+    con: sqlite3.Connection,
+    blocks: Iterable[dict[str, Any]],
+    date: str,
+    prefer: str = "BUFF",
+) -> int:
+    """写入当日快照。
+
+    ⚠️ date 必须由调用方**每批重新算**。踩过的坑：常驻采集在循环外算了一次
+    `day` 就一路用到底，跨过午夜后把新报价继续写进前一天的记录里
+    （实测：1,994 行 10-11 的数据是 10-12 凌晨 01:29 写进去的，
+    等于用第二天的盘中价覆盖了第一天的收盘价）。
+
+    ⚠️ ts 用响应里的 updateTime（这条报价自己的时间），不是本机写入时刻。
+    否则「旧报价不许覆盖新报价」这条约束根本无从判断（见 SNAP_UPSERT_QUOTE）。
+    """
     n = 0
+    fallback: dict[str, int] = {}
+    now_ts = int(time.time())
     for blk in blocks:
         name = blk.get("marketHashName")
-        row = pick_platform(blk)
+        row = pick_platform(blk, prefer)
         if not name or not row:
             continue
+        plat = str(row.get("platform") or "?")
+        if plat != prefer:
+            fallback[plat] = fallback.get(plat, 0) + 1
         con.execute(
-            SNAP_UPSERT,   # 不是 INSERT OR REPLACE：只更新提供的列，不清空已有供需字段
+            SNAP_UPSERT_QUOTE,   # 不是 INSERT OR REPLACE，也不是无比较的 UPSERT
             (
                 name,
                 date,
@@ -233,11 +287,16 @@ def write_daily_snapshot(con: sqlite3.Connection, blocks: Iterable[dict[str, Any
                 row.get("sellCount"),
                 None,       # 成交量由 Steam 侧补充
                 None,       # 存世量需另接数据源
-                int(time.time()),
+                int(row.get("updateTime") or now_ts),
+                plat,
             ),
         )
         n += 1
     con.commit()
+    if fallback:
+        log.warning("平台回退 %d 个品种（本地样本里 %s 缺失）：%s —— "
+                    "这些行的 src 不是 %s，混口径会在价格序列里制造人工跳价；"
+                    "需要时可按 src 过滤", sum(fallback.values()), prefer, fallback, prefer)
     return n
 
 
@@ -303,6 +362,10 @@ def collect_listings(
 
     max_batches: 只跑 N 批就返回（测试用；None = 跑满一轮）。
     """
+    # ⚠️ day 不能只在循环外算一次：这个循环是**常驻**的（一轮约 86 分钟，
+    # 一轮接一轮），算一次的话跨过午夜后，第二天的新报价会继续写进
+    # 前一天的记录里 —— 等于用第二天的盘中价覆盖第一天的收盘价。
+    # 实测：1,994 行 2026-10-11 的数据是 10-12 凌晨 01:29 写的。
     day = datetime.now().strftime("%Y-%m-%d")
     stats = {"batches": 0, "items": 0, "rows": 0, "fail": 0, "day": day}
     if not names:
@@ -334,6 +397,14 @@ def collect_listings(
             log.error("挂单量采集失败（游标停在 %d，下轮重试）：%s", cur, e)
             time.sleep(interval * 2)
             continue
+
+        # 每批重新取日期：常驻服务会跨午夜，不能把启动日期一路用下去
+        new_day = datetime.now().strftime("%Y-%m-%d")
+        if new_day != day:
+            log.info("挂单量采集：跨日 %s → %s，后续行情写入新日期（旧日期不再改动）",
+                     day, new_day)
+            day = new_day
+            stats["day"] = new_day
 
         stats["rows"] += write_daily_snapshot(con, blocks, day)
         stats["items"] += len(chunk)
@@ -457,7 +528,26 @@ def fetch_kline(
     return data if isinstance(data, list) else []
 
 
-def write_kline_rows(con: sqlite3.Connection, item_id: str, rows: list, write_kline: bool = True) -> int:
+def _ohlc_ok(o: float, h: float, l: float, c: float) -> bool:
+    """K 线自洽性 + 有限性校验。
+
+    踩过的坑：这里原先只做 float() 转换就落库 —— 而 float("nan") / float("inf")
+    都不抛异常，矛盾的 bar（high < max(o,c)）也照写。字段顺序那个坑
+    （[ts,o,c,h,l] 被当成 [ts,o,h,l,c]）正是靠这条不变量才认得出来：
+    回归测试里一直有同款检查，但**生产代码里从来没接上**。
+    """
+    if not all(math.isfinite(v) and v > 0 for v in (o, h, l, c)):
+        return False
+    return h >= max(o, c) - 1e-9 and l <= min(o, c) + 1e-9
+
+
+def write_kline_rows(
+    con: sqlite3.Connection,
+    item_id: str,
+    rows: list,
+    write_kline: bool = True,
+    src: str = "BUFF",
+) -> int:
     """K 线行 → snap（价格）+ kline（完整 OHLC）
 
     ⚠️ 字段顺序是 [ts, open, close, high, low]，**不是** [ts, o, h, l, c]。
@@ -465,21 +555,27 @@ def write_kline_rows(con: sqlite3.Connection, item_id: str, rows: list, write_kl
        全被记成「当日最低价」，与实盘系统性偏低。判据：字段顺序为 [o,h,l,c] 时
        会出现 high < low 的矛盾；按 [o,c,h,l] 解释则 6/6 条都满足
        high >= max(o,c) 且 low <= min(o,c)，且 close 与实时在售价完全一致。
+       现在这条判据已经进 _ohlc_ok()，不合规的 bar 直接丢弃。
 
     ⚠️ 时间戳是 UTC 16:00（= 北京时间 00:00）。必须按北京时间归日，
        否则整条序列偏移一天（踩过：10-10 的数据被记成 10-09）。
     """
     n = 0
+    bad = 0
     for row in rows:
         try:
             ts = int(row[0])
             o, c, h, l = float(row[1]), float(row[2]), float(row[3]), float(row[4])
         except (IndexError, TypeError, ValueError):
+            bad += 1
+            continue
+        if not _ohlc_ok(o, h, l, c):
+            bad += 1
             continue
         day = datetime.fromtimestamp(ts + 8 * 3600, tz=timezone.utc).strftime("%Y-%m-%d")
         # 关键：K 线只提供价格，用 SNAP_UPSERT 保证它不会把 batch 采集补上的
         # bid / listings 清成 NULL（原先的 INSERT OR REPLACE 会）
-        con.execute(SNAP_UPSERT, (item_id, day, c, None, None, None, None, ts))
+        con.execute(SNAP_UPSERT, (item_id, day, c, None, None, None, None, ts, src))
         if write_kline:
             con.execute(
                 "INSERT INTO kline (item_id, date, o, h, l, c, v) VALUES (?,?,?,?,?,?,?) "
@@ -489,6 +585,9 @@ def write_kline_rows(con: sqlite3.Connection, item_id: str, rows: list, write_kl
                 (item_id, day, o, h, l, c, None),
             )
         n += 1
+    if bad:
+        log.warning("%s：丢弃 %d 条不合格 K 线（非有限值 / 非正数 / OHLC 自相矛盾）",
+                    item_id[:44], bad)
     return n
 
 
