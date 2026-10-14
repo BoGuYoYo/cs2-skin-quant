@@ -8,8 +8,11 @@
 """
 from __future__ import annotations
 
+import atexit
 import math
+import shutil
 import sys
+import tempfile
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +36,47 @@ from pipeline.config import (  # noqa: E402
 )
 
 FAIL: list[str] = []
+
+
+# ============================================================ 进程级隔离闸门
+# ⚠️ [P0] 测试进程里的推送通道必须指向临时库（第九轮审查踩到的坑，真实发生过）。
+#
+# 起因：abort_no_cross_section 新增了「把『今天没有截面』推到各通道」，
+# 而回归测试用它自带的临时 con 调用这个函数 —— 本地清理走临时库，
+# 通道那侧的 to_local._DB_PATH 却仍指向**生产库**。于是在服务器上
+# 跑一遍测试：线上 factor_latest 被整表清空、meta 的 last_run /
+# no_cross_section_on 被写成测试日期，看板瞬间变成「今日无截面」。
+# 测试把生产数据删了，比没有测试更糟。
+#
+# 所以这里在**进程级**把两件事钉死：
+#   1) 本地推送通道 → 临时目录里的空库（跑完自动删）
+#   2) dispatch.MODE = "local" —— 测试绝不联网、绝不写云端
+# 各测试自己打的桩在此基础上叠加，互不影响。
+_TEST_TMP = tempfile.mkdtemp(prefix="skin-alpha-regression-")
+atexit.register(shutil.rmtree, _TEST_TMP, ignore_errors=True)
+
+import push.dispatch as _dispatch  # noqa: E402
+import push.to_local as _to_local  # noqa: E402
+
+#: 打桩之前的默认路径 —— 也就是「真实库」。测试拿它来证明自己没碰生产数据。
+REAL_DB_PATH = _to_local._DB_PATH
+_dispatch.MODE = "local"                                    # type: ignore[assignment]
+_to_local._DB_PATH = Path(_TEST_TMP) / "push.db"            # type: ignore[assignment]
+
+
+def _web_src(rel: str) -> str | None:
+    """读前端源码；本机没部署这份源码时返回 None 并说明。
+
+    回归测试要同时在开发机和**服务器**上跑，而服务器只保证有构建产物，
+    前端源码是可选部署的（历史上就漏部署过 components/ProgressPanel.tsx）。
+    源码级断言在缺文件时应当跳过并打印原因，而不是让整套测试崩掉 ——
+    一套跑不起来的测试等于没有测试。
+    """
+    p = SERVER.parent / "web" / "src" / rel
+    if not p.exists():
+        print(f"  [SKIP] web/src/{rel} 未部署到本机，源码级断言跳过")
+        return None
+    return p.read_text(encoding="utf-8")
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -1308,12 +1352,13 @@ def test_stale_forecast_marked_on_detail_page() -> None:
     check("不再只看全局 no_cross_section 标记",
           'marker and marker == last_run' not in api_src)
 
-    web = SERVER.parent / "web" / "src"
-    ts = (web / "lib" / "api.ts").read_text(encoding="utf-8")
-    check("前端类型里有 stale 字段", "stale?: boolean" in ts)
-    page = (web / "pages" / "ItemDetail.tsx").read_text(encoding="utf-8")
-    check("详情页对 stale 预测显示提示而不是买入标签",
-          "fc?.stale" in page and "非当前建议" in page)
+    ts = _web_src("lib/api.ts")
+    if ts is not None:
+        check("前端类型里有 stale 字段", "stale?: boolean" in ts)
+    page = _web_src("pages/ItemDetail.tsx")
+    if page is not None:
+        check("详情页对 stale 预测显示提示而不是买入标签",
+              "fc?.stale" in page and "非当前建议" in page)
 
 
 def test_stale_quote_never_enters_history() -> None:
@@ -1780,13 +1825,14 @@ def test_review_9_fixes() -> None:
     app = (SERVER / "app.py").read_text(encoding="utf-8")
     check("/api/progress 由服务器算 age_seconds（前端比时钟会受时钟漂移影响）",
           "age_seconds" in app)
-    api_ts = (SERVER.parent / "web" / "src" / "lib" / "api.ts").read_text(encoding="utf-8")
-    check("前端类型带 age_seconds", "age_seconds" in api_ts)
-    panel = (SERVER.parent / "web" / "src" / "components" / "ProgressPanel.tsx").read_text(
-        encoding="utf-8")
-    check("进度面板把「很久没上报」的任务标成疑似中断（而不是显示 RUNNING）",
-          "疑似中断" in panel and "isStale" in panel and "STALE" in panel)
-    check("挂单量采集有中文标签（原先掉到英文裸键）", "挂单量采集" in panel)
+    api_ts = _web_src("lib/api.ts")
+    if api_ts is not None:
+        check("前端类型带 age_seconds", "age_seconds" in api_ts)
+    panel = _web_src("components/ProgressPanel.tsx")
+    if panel is not None:
+        check("进度面板把「很久没上报」的任务标成疑似中断（而不是显示 RUNNING）",
+              "疑似中断" in panel and "isStale" in panel and "STALE" in panel)
+        check("挂单量采集有中文标签（原先掉到英文裸键）", "挂单量采集" in panel)
 
     # ---- 8) --dry-run 必须「什么也不改」----
     check("dry-run 不再跑采集（原先 84 分钟还顺手写 snap/kline）", "elif dry_run:" in rd)
@@ -1797,6 +1843,52 @@ def test_review_9_fixes() -> None:
     sig = inspect.signature(run_daily.load_or_train).parameters
     check("load_or_train 有 persist 开关且默认落盘",
           "persist" in sig and sig["persist"].default is True)
+
+
+def test_push_isolation_never_touches_real_db() -> None:
+    """[P0] 测试进程的推送通道必须指向临时库 —— 跑测试不许动生产数据。
+
+    踩过的坑（真实发生过，见文件顶部的隔离闸门注释）：abort_no_cross_section
+    开始往各通道推「清空」之后，回归测试用它自带的临时 con 调它，
+    通道那侧却仍指向生产库 → 在服务器上跑一遍测试，线上 factor_latest
+    被清空、meta 标记被写成测试日期。
+    """
+    print("\n[44] 测试隔离：推送通道不许碰真实库")
+    import sqlite3  # noqa: PLC0415
+
+    import push.dispatch as dp  # noqa: PLC0415
+    import push.to_local as tl  # noqa: PLC0415
+    from pipeline import run_daily  # noqa: PLC0415
+
+    check("本地推送通道已指向临时库（不再是默认的生产路径）",
+          str(tl._DB_PATH) != str(REAL_DB_PATH), f"{tl._DB_PATH}")
+    check("临时库不在生产 state 目录里",
+          "state" not in Path(tl._DB_PATH).parts, f"{tl._DB_PATH}")
+    check("推送模式被钉死在 local（测试不联网、不写云端）", dp.MODE == "local")
+
+    # 功能证明：调用一个「会往通道推清空」的函数，真实库必须毫发无损
+    def _fingerprint() -> tuple:
+        if not REAL_DB_PATH.exists():
+            return ("absent",)
+        st = REAL_DB_PATH.stat()
+        return (st.st_size, st.st_mtime_ns)
+
+    before = _fingerprint()
+    # 放进进程级临时目录（退出时 ignore_errors 清理）—— 不用 TemporaryDirectory：
+    # Windows 上 sqlite 连接即使 close 也可能晚一点释放句柄，rmtree 会炸在退出前
+    iso = Path(_TEST_TMP) / "iso.db"
+    con = sqlite3.connect(str(iso))
+    try:
+        tl.ensure_schema(con)
+        run_daily.abort_no_cross_section(con, "1999-01-01", dry_run=False)
+    finally:
+        con.close()
+    check("调用 abort_no_cross_section 后真实库一个字节都没变",
+          _fingerprint() == before, f"{before} -> {_fingerprint()}")
+
+    # 反向证明：桩确实拆掉过（否则上面那条是空断言）
+    check("临时库确实被写过（证明断言不是空跑）",
+          Path(tl._DB_PATH).exists())
 
 
 def main() -> int:
@@ -1846,6 +1938,7 @@ def main() -> int:
     test_push_replace_semantics()
     test_misc_hardening()
     test_review_9_fixes()
+    test_push_isolation_never_touches_real_db()
     print("\n" + "=" * 62)
     if FAIL:
         print(f"结果：{len(FAIL)} 项失败 → {FAIL}")
