@@ -275,14 +275,19 @@ def push(
         raise D1Error(f"未知 stage：{stage}（可用：{', '.join(STAGES)}）")
 
     rows = list(rows)
-    if not rows:
-        log.info("stage=%s 无数据，跳过", stage)
-        return 0
 
     table = _table_of(stage)
     changed = 0
 
     # 幂等重跑：先删旧的
+    #
+    # ⚠️ 这一段必须在 `if not rows: return 0` **之前**（审查 9 发现）。
+    # 原先空列表直接 return，于是「本轮不该有行」的删除语义整批丢失：
+    #   - alerts（只有 ts）：某天异动归零时 replaceSince 被跳过，
+    #     本地已撤回的告警在 D1 里继续挂着；
+    #   - forecast / factor_latest：abort_no_cross_section 想把
+    #     「今天没有截面」推上云端，只能推空列表 —— 同样被跳过。
+    # 删除与插入是两件事，不能共用「有没有行」这一个前置条件。
     if replace_all:
         changed += _query(f"DELETE FROM {table}", [])
     if replace_date and "date" in cols:
@@ -294,6 +299,10 @@ def push(
         changed += _query(f"DELETE FROM {table} WHERE ts >= ?", [replace_since_ts])
     elif replace_since_ts is not None:
         log.warning("stage=%s 不支持 replace_since_ts（没有 ts 列），本次未做按时间替换", stage)
+
+    if not rows:
+        log.info("stage=%s 无数据，跳过插入（删除 %d 行）", stage, changed)
+        return changed
 
     if USE_PARAMS:
         # 参数绑定模式：每语句最多 100 个参数，慢但完全免注入（D1_USE_PARAMS=1 才启用）

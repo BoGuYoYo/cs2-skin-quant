@@ -192,6 +192,8 @@ export interface TaskProgress {
   message: string | null;
   started_at: number | null;
   updated_at: number;
+  /** 距上次上报多少秒（服务器算的，避免浏览器时钟漂移）—— 判断任务是否已经断了 */
+  age_seconds?: number | null;
 }
 
 // ------------------------------------------------------------------ 接口

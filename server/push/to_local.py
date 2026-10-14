@@ -196,7 +196,22 @@ def push(
         raise ValueError(f"未知 stage：{stage}")
 
     rows = list(rows)
-    if not rows:
+
+    # ⚠️ rows 为空时**仍然要**执行下面的 replace_* 删除（审查 9 发现）。
+    # 「本轮没有行」和「本轮不该有行」是两件事，而三个通道原先都在
+    # `if not rows: return 0` 处提前返回 —— 删除语句在它后面，于是：
+    #   1) 某天异动归零（alert_rows=[]）时，`DELETE FROM alerts WHERE ts >= day_start`
+    #      被跳过，本地已经撤回的告警在 D1 里继续挂着（本地那句 DELETE 是无条件的）；
+    #   2) run_daily 的 abort_no_cross_section 想把「今天没有截面」推上云端，
+    #      只能推空列表 —— 同样被跳过。
+    # 所以顺序改成：先算删除，再决定要不要插入。
+    has_replace = (
+        replace_all
+        or (replace_date is not None and "date" in cols)
+        or (replace_series is not None and "item_id" in cols)
+        or (replace_since_ts is not None and "ts" in cols)
+    )
+    if not rows and not has_replace:
         return 0
 
     # 列集合：整行替换型 stage 用**全部列**（缺值写 NULL）；
@@ -208,7 +223,7 @@ def push(
     complete = stage in COMPLETE_STAGES
     present = (list(cols) if complete
                else [c for c in cols if any(c in r and r[c] is not None for r in rows)])
-    if not present:
+    if rows and not present:
         return 0
 
     pk = [c for c in _PK.get(stage, []) if c in present]
@@ -235,6 +250,12 @@ def push(
         if replace_since_ts is not None and "ts" in cols:
             cur = con.execute(f"DELETE FROM {stage} WHERE ts >= ?", (replace_since_ts,))
             changed += cur.rowcount or 0
+
+        if not rows:
+            # 本轮没有新行：删除已经执行完，别再去拼一条空 INSERT。
+            # 返回删除行数而不是 0 —— 让调用方看得出「这次确实动了库」。
+            con.commit()
+            return changed
 
         ph = ",".join(["?"] * len(present))
         if use_upsert:

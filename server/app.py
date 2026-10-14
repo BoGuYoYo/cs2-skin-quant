@@ -187,9 +187,19 @@ def meta() -> dict[str, Any]:
 def progress() -> dict[str, Any]:
     con = db()
     try:
-        return ok(rows_to_list(con.execute(
+        now = int(time.time())
+        rows = rows_to_list(con.execute(
             "SELECT * FROM task_progress ORDER BY updated_at DESC LIMIT 20"
-        ).fetchall()))
+        ).fetchall())
+        # age_seconds 由**服务器**算（审查 9 发现）：
+        # 前端只能拿浏览器时钟去比，时钟一漂就会误判；而「一个 status=running
+        # 的行已经多久没上报了」是判断常驻进程死没死的唯一依据 ——
+        # 挂单量采集器一分钟一报，两小时没动静就只可能是进程没了，
+        # 而面板原先照样显示 RUNNING（看板说谎）。
+        for r in rows:
+            ts = r.get("updated_at")
+            r["age_seconds"] = max(0, now - int(ts)) if ts else None
+        return ok(rows)
     finally:
         con.close()
 

@@ -26,6 +26,24 @@ from .config import Cfg
 
 
 # ------------------------------------------------------------------ A. 异动检测
+def _simple_pct(v: Any) -> float:
+    """对数净收益 → 简单净收益百分比。
+
+    ⚠️ 理由串里的收益**必须**过这一层（审查 9 发现）。
+    踩过的坑：打分那一行老老实实写了 expm1，紧接着打印那一行却写
+    `f"21日 {r21 * 100:.1f}%"` —— 同一行代码里两套口径，于是
+    ret_21d = -0.501（真实跌 39.4%）在看板上显示成「21日 -50.1%」，
+    手机推送、alerts.detail、详情页三处一起夸大。而前端 format.ts 的 logPct()
+    和 push/notify.log_to_simple_pct 都是对的，只有这一路错 —— 属于
+    「同一个数在三个地方显示成两个值」这类最难被发现的 bug。
+
+    公式不在这里重写：唯一实现在 push/notify.log_to_simple_pct（带完整踩坑记录），
+    惰性导入避免 pipeline 在 import 期就依赖 push（push 会读环境变量、拉 requests）。
+    """
+    from push.notify import log_to_simple_pct   # 运行时才导入，见 docstring
+    return log_to_simple_pct(v)
+
+
 def detect_anomaly(row: dict[str, Any], cfg: Cfg) -> tuple[str | None, float, str]:
     """返回 (等级 或 None, 打分, 理由串)"""
     score = 0.0
@@ -35,12 +53,12 @@ def detect_anomaly(row: dict[str, Any], cfg: Cfg) -> tuple[str | None, float, st
     if r21 is not None and not _nan(r21) and r21 < 0:
         drop = abs(math.expm1(r21)) * 100  # 对数收益 → 百分比跌幅
         score += min(drop / 25.0, 1.0) * 40
-        why.append(f"21日 {r21 * 100:.1f}%")
+        why.append(f"21日 {_simple_pct(r21):.1f}%")
 
     r7 = row.get("ret_7d")
     if r7 is not None and not _nan(r7) and r7 < 0:
         score += min(abs(r7) / 0.06, 1.0) * 15
-        why.append(f"7日 {r7 * 100:.1f}%")
+        why.append(f"7日 {_simple_pct(r7):.1f}%")
 
     z = row.get("vol_z")
     if z is not None and not _nan(z) and z < 0:
@@ -56,7 +74,7 @@ def detect_anomaly(row: dict[str, Any], cfg: Cfg) -> tuple[str | None, float, st
     rel = row.get("rel_ret_21d")
     if rel is not None and not _nan(rel) and rel < -0.10:
         score += 10
-        why.append(f"弱于大盘 {rel * 100:.1f}%")
+        why.append(f"弱于大盘 {_simple_pct(rel):.1f}%")
 
     # ---- 流动性闸门 ----
     listings = row.get("listings")

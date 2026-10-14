@@ -2,7 +2,7 @@
 
 用法：
     python -m pipeline.run_daily                 # 完整跑一遍并推送
-    python -m pipeline.run_daily --dry-run       # 只算不推
+    python -m pipeline.run_daily --dry-run       # 只算不写：不采集、不落盘模型、不推送
     python -m pipeline.run_daily --backtest      # 只做 walk-forward 评估，打印验收结论
 """
 from __future__ import annotations
@@ -103,8 +103,14 @@ def load_watchlist(con) -> list[str]:
     return collector.load_watchlist(con)
 
 
-def load_or_train(cfg: Cfg, labeled: pd.DataFrame) -> tuple[QuantileModel, CQR, dict[str, Any]]:
-    """按 retrain_days 决定是否重训；同时产出 CQR 校准器"""
+def load_or_train(cfg: Cfg, labeled: pd.DataFrame,
+                  persist: bool = True) -> tuple[QuantileModel, CQR, dict[str, Any]]:
+    """按 retrain_days 决定是否重训；同时产出 CQR 校准器
+
+    persist=False（--dry-run）时**不写模型文件**（审查 9 发现）：
+    原先试跑一旦触发重训就会覆盖线上 state/model.pkl，而这次的预测又全被丢掉 ——
+    等于用一次实验性训练替换了生产模型，且没有任何提示。
+    """
     meta: dict[str, Any] = {}
     mature = labeled.dropna(subset=["y"])
     if "is_warm" in mature.columns:
@@ -154,7 +160,10 @@ def load_or_train(cfg: Cfg, labeled: pd.DataFrame) -> tuple[QuantileModel, CQR, 
         w = labels.sample_weights(train_part, cfg)
         log.info("训练：%d 行 × %d 特征", len(train_part), len(FEATURE_COLS))
         mdl = model_train(train_part, w, cfg)
-        mdl.save(cfg.model_path)
+        if persist:
+            mdl.save(cfg.model_path)
+        else:
+            log.warning("--dry-run：训练完成但**不落盘**（线上模型文件保持不变）")
 
     # ---- CQR 校准：永远用「训练段之后的独立窗口」----
     train_part, calib_part = _split_tail(mature, 0.8, cfg.horizon)
@@ -261,6 +270,7 @@ def abort_no_cross_section(con, day: str, dry_run: bool) -> None:
     if dry_run:
         log.warning("--dry-run：跳过清理，不改动任何数据")
         return
+    now_ts = int(time.time())
     n1 = prune_factor_latest(con, [])
     n2 = 0
     try:
@@ -269,7 +279,6 @@ def abort_no_cross_section(con, day: str, dry_run: bool) -> None:
     except Exception as e:      # noqa: BLE001
         log.warning("清理今日 forecast 失败：%s", e)
     try:
-        now_ts = int(time.time())
         con.executemany(
             "INSERT INTO meta (k, v, updated_at) VALUES (?,?,?) "
             "ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at",
@@ -278,6 +287,23 @@ def abort_no_cross_section(con, day: str, dry_run: bool) -> None:
         con.commit()
     except Exception as e:      # noqa: BLE001
         log.warning("写入 no_cross_section 标记失败：%s", e)
+
+    # ⚠️ 本地清完，还要把「今天没有截面」推到每一条通道（审查 9 发现）。
+    # 原先这里从头到尾只用一个本地连接，云端那份 forecast / factor_latest / meta
+    # 原封不动 —— 于是读 D1 的备份看板继续把早上的买入清单当当前建议，
+    # 而本地 API 已经诚实地返回空。第 8 轮给成功路径补了 replaceAll/replaceSince，
+    # 漏了这条失败路径（同一个 bug 的另一半）。
+    # 空批次也必须发：三个通道原先都在「rows 为空」处提前返回，
+    # 于是「清空」这个语义根本到不了云端（本轮一并修掉）。
+    try:
+        dispatch.push("factor_latest", [], replace_all=True)
+        dispatch.push("forecast", [], replace_date=day)
+        dispatch.push("meta", [
+            {"k": "last_run", "v": day, "updated_at": now_ts},
+            {"k": "no_cross_section_on", "v": day, "updated_at": now_ts},
+        ])
+    except Exception as e:      # noqa: BLE001
+        log.warning("把「无截面」推送到云端失败（本地已是事实源，看板以本地为准）：%s", e)
     log.warning("已清理 factor_latest %d 条、今日 forecast %d 条，并标记今天无截面", n1, n2 or 0)
 
 
@@ -443,6 +469,13 @@ def _push_cold_start(con, cfg: Cfg, day: str, now_ts: int, labeled, reason: str)
                 {"k": "status", "v": "cold_start", "updated_at": now_ts},
                 {"k": "cold_start_reason", "v": reason[:200], "updated_at": now_ts},
                 {"k": "feature_rows", "v": str(len(labeled)), "updated_at": now_ts},
+                # ⚠️ 必须同时把「本次没有产生截面」写成今天（审查 9 发现）。
+                # /api/candidates 的守卫判据是 marker == last_run：只推 last_run
+                # 会让守卫失效，接口立刻退回 MAX(date) —— 把更早那天的买入建议
+                # 当成今天的结果返回，而今天根本没有模型、一条预测都没产生。
+                # （factor_latest 故意不动：它是「最近一次成功截面」，
+                #   筛选页的语义就是看这份快照；候选页才是按日锚定的。）
+                {"k": "no_cross_section_on", "v": day, "updated_at": now_ts},
             ], {}),
             ("runs", [
                 {"ts": now_ts, "stage": "daily-coldstart", "ok": 1, "rows": len(item_rows),
@@ -478,6 +511,11 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
     watchlist = load_watchlist(con)
     if skip_collect:
         log.info("--skip-collect：跳过采集，直接用库里的历史（监控池 %d 个）", len(watchlist))
+    elif dry_run:
+        # ⚠️ --dry-run 的约定是「什么也不改」（审查 9 发现）：
+        # 原先试跑照样跑完整采集 —— 84 分钟，还把行情写进 snap/kline。
+        # 试跑想快速看新特征/新模型的效果，就不该顺手改行情库。
+        log.warning("--dry-run：跳过采集（试跑不写行情库）。要采集就去掉 --dry-run")
     else:
         if not watchlist:
             log.warning("items 表为空，先跑一次 base 同步（每天限 1 次）")
@@ -560,15 +598,20 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
         return 0 if ok else 1
 
     # ---------------- 4. 模型 + 校准 ----------------
-    task_progress.report("train", "running", force=True,
-                         message=f"训练中（{len(labeled):,} 行特征）")
+    # ⚠️ dry_run 下既不上报进度（progress.report 会真的写库并推送到各通道），
+    # 也不落盘模型 —— 见下面 load_or_train(persist=...) 的注释（审查 9 发现）。
+    if not dry_run:
+        task_progress.report("train", "running", force=True,
+                             message=f"训练中（{len(labeled):,} 行特征）")
     try:
-        mdl, cqr, calib_meta = load_or_train(cfg, labeled)
-        task_progress.finish("train", message=f"训练完成 · {cfg.model_version}")
+        mdl, cqr, calib_meta = load_or_train(cfg, labeled, persist=not dry_run)
+        if not dry_run:
+            task_progress.finish("train", message=f"训练完成 · {cfg.model_version}")
     except RuntimeError as e:
         log.error("%s", e)
         fails.append(str(e))
-        task_progress.fail("train", str(e))
+        if not dry_run:
+            task_progress.fail("train", str(e))
         if not dry_run:
             log.warning("冷启动期：跳过预测，但仍推送已采集的基础数据（items / kline）")
             _push_cold_start(con, cfg, day, now_ts, labeled, str(e))
@@ -944,7 +987,8 @@ def _print_top(candidates: list[dict[str, Any]]) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="skin-alpha 每日管线")
-    ap.add_argument("--dry-run", action="store_true", help="只计算不推送")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="只计算：不采集、不落盘模型、不推送（什么也不改）")
     ap.add_argument("--backtest", action="store_true", help="只做 walk-forward 评估并打印验收结论")
     ap.add_argument("--skip-collect", action="store_true",
                     help="跳过采集（复用库里已有历史）—— 改完特征/模型后快速重跑用，"

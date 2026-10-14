@@ -1587,6 +1587,218 @@ def test_misc_hardening() -> None:
           tr.empty and not cal.empty, f"train={len(tr)} calib={len(cal)}")
 
 
+def test_review_9_fixes() -> None:
+    """[43] 第九轮审查修复：9 条发现，一组断言一条。
+
+    共同特征全是「程序不报错、但数据或看板说谎」：
+    对数收益当百分比打印、空批次跳过删除、非 BUFF 价格进模型特征、
+    缺失箱价让整箱从看板消失、进度条永久停在 0%、dry-run 照样写库……
+    """
+    print("\n[43] 第九轮审查修复")
+    import inspect  # noqa: PLC0415
+    import math  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    import push.to_local as tl  # noqa: PLC0415
+    from pipeline import cases_build as cb  # noqa: PLC0415
+    from pipeline import run_daily  # noqa: PLC0415
+
+    # ---- 1) 告警理由里的收益必须是「简单收益百分比」----
+    # 踩过的坑：打分那一行写 expm1，紧接着打印那一行写 r21 * 100 ——
+    # ret_21d=-0.51（真实跌 39.4%）在三个看板页面和手机推送上都显示成 -51%。
+    r21 = math.log1p(-0.4)          # 对数收益：真实跌幅 40%
+    _, _, why = decide.detect_anomaly(
+        {"ret_21d": r21, "ret_7d": r21, "vol_z": -6.0, "listings": 500}, CFG)
+    check("异动理由用简单收益打印（不是对数乘 100）", "21日 -40.0%" in why, why)
+    check("7 日同样换算", "7日 -40.0%" in why, why)
+    _, _, why2 = decide.detect_anomaly(
+        {"ret_21d": r21, "ret_7d": r21, "vol_z": -6.0, "listings": 500,
+         "rel_ret_21d": math.log1p(-0.2)}, CFG)
+    check("弱于大盘也是简单收益", "弱于大盘 -20.0%" in why2, why2)
+    dec_src = (SERVER / "pipeline" / "decide.py").read_text(encoding="utf-8")
+    check("decide 里不再有把对数当百分比乘 100 的写法",
+          "log_to_simple_pct" in dec_src)
+    check("三处收益展示都走同一个换算出口（不再有手抄的乘 100）",
+          dec_src.count("_simple_pct(") >= 3, f"{dec_src.count('_simple_pct(')} 处")
+
+    # ---- 2) 空批次也必须执行 replace_* 删除 ----
+    with tempfile.TemporaryDirectory() as td:
+        real = tl._DB_PATH
+        tl._DB_PATH = Path(td) / "push.db"       # type: ignore[assignment]
+        conn = tl.connect()
+        try:
+            # 某天异动归零：本地已经无条件删了当天告警，删除语义必须真的生效
+            tl.push("alerts", [{"item_id": "A", "level": "L3", "ts": 200, "score": 1.0}])
+            tl.push("alerts", [], replace_since_ts=150)
+            n = conn.execute("SELECT COUNT(*) FROM alerts WHERE ts >= 150").fetchone()[0]
+            check("空批次也执行 replace_since_ts（异动归零那天旧告警被清掉）",
+                  n == 0, f"剩 {n} 行")
+
+            tl.push("forecast", [{"item_id": "A", "date": "2026-10-13", "horizon": 21,
+                                  "q10": 0.1, "q50": 0.2, "q90": 0.3, "side": "buy",
+                                  "size": 0.1, "score": 1.0}])
+            tl.push("forecast", [], replace_date="2026-10-13")
+            n = conn.execute("SELECT COUNT(*) FROM forecast").fetchone()[0]
+            check("空批次也执行 replace_date", n == 0, f"剩 {n} 行")
+
+            tl.push("factor_latest", [{"item_id": "A", "date": "2026-10-13",
+                                       "price": 1.0, "updated_at": 1}])
+            tl.push("factor_latest", [], replace_all=True)
+            n = conn.execute("SELECT COUNT(*) FROM factor_latest").fetchone()[0]
+            check("空批次也执行 replace_all（「今天没有截面」才推得出去）",
+                  n == 0, f"剩 {n} 行")
+
+            check("没有 replace_* 的空批次仍然走快速返回（不去连库）",
+                  tl.push("items", []) == 0)
+        finally:
+            conn.close()
+            tl._DB_PATH = real       # type: ignore[assignment]
+
+    d1 = (SERVER / "push" / "to_d1.py").read_text(encoding="utf-8")
+    cf = (SERVER / "push" / "to_cloudflare.py").read_text(encoding="utf-8")
+    tl_src = (SERVER / "push" / "to_local.py").read_text(encoding="utf-8")
+    check("to_d1 的删除在空批次判断之前",
+          d1.index("DELETE FROM {table}") < d1.index("无数据，跳过插入"))
+    check("to_local 的删除同样在空批次判断之前",
+          "本轮没有新行：删除已经执行完" in tl_src)
+    check("to_cloudflare 空批次仍会把 replace_* 发出去",
+          "if not rows and not has_replace" in cf and "offsets = list(range" in cf)
+
+    ing = (SERVER.parent / "worker" / "routes" / "ingest.ts").read_text(encoding="utf-8")
+    check("Worker 不再在空批次处提前返回（删除必须先执行）",
+          "if (rows.length === 0) return ok(" not in ing)
+    check("Worker 的插入循环按行数守卫", "if (rows.length > 0) {" in ing)
+
+    # ---- 3) 「无截面」收尾必须推到每一条通道 ----
+    pushed: list[tuple[str, dict]] = []
+    real_push = run_daily.dispatch.push
+
+    def _fake_push(stage, rows, **kw):     # noqa: ANN001, ANN202
+        pushed.append((stage, kw))
+        return 0
+
+    for dry in (False, True):
+        pushed.clear()
+        run_daily.dispatch.push = _fake_push     # type: ignore[assignment]
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                con = collector.connect(Path(td) / "a.db")
+                run_daily.abort_no_cross_section(con, "2026-10-13", dry_run=dry)
+                con.close()
+        finally:
+            run_daily.dispatch.push = real_push   # type: ignore[assignment]
+        if dry:
+            check("dry-run 下无截面收尾什么都不推", pushed == [], str(pushed))
+        else:
+            check("无截面时把 factor_latest 的整表替换推出去",
+                  ("factor_latest", {"replace_all": True}) in pushed, str(pushed))
+            check("无截面时把今日 forecast 的替换推出去",
+                  ("forecast", {"replace_date": "2026-10-13"}) in pushed, str(pushed))
+            check("无截面时把标记推进 meta", "meta" in [s for s, _ in pushed])
+
+    # ---- 4) 冷启动必须写「本次没有截面」的标记 ----
+    rd = (SERVER / "pipeline" / "run_daily.py").read_text(encoding="utf-8")
+    check("冷启动也写 no_cross_section_on（否则候选接口退回更早那天的买入清单）",
+          '"no_cross_section_on", "v": day' in rd)
+
+    # ---- 5) 箱子价格只认 BUFF，且取「最新有效价」----
+    days = ["2026-10-09", "2026-10-10", "2026-10-11", "2026-10-12", "2026-10-13"]
+    with tempfile.TemporaryDirectory() as td:
+        con = collector.connect(Path(td) / "c.db")
+        rows: list[tuple[str, str, float | None, str | None]] = []
+        # X：最新一行的价格是无效报价（故意写 NULL）—— 必须退回上一个有效价，
+        #     否则「箱子没有价格」→ 稀有度掉 45 分 → 整箱被 case_rarity_min 剔掉
+        rows += [("X", "2026-10-12", 100.0, "BUFF"), ("X", "2026-10-13", None, "BUFF")]
+        rows += [("Y", d, 50.0, "C5") for d in days]        # 只有回退平台的报价
+        rows += [("Z", "2026-10-13", 30.0, None)]           # 加 src 列之前的历史行
+        rows += [("W", d, 10.0, "BUFF") for d in days]
+        con.executemany("INSERT INTO snap (item_id, date, sell, src) VALUES (?,?,?,?)", rows)
+        con.commit()
+        p = cb.latest_prices(con)
+        check("最新一行没有价格时退回上一个有效价（不把箱子判成没有价格）",
+              p.get("X") == 100.0, str(p))
+        check("回退平台的价格不当箱价（非 BUFF 不进模型特征）", "Y" not in p, str(p))
+        check("加 src 列之前的历史行仍然算数", p.get("Z") == 30.0, str(p))
+        check("price_trend 同样只认 BUFF", cb.price_trend(con, "Y") is None)
+        check("BUFF 行的趋势照常算得出来", cb.price_trend(con, "W") is not None)
+        con.close()
+
+    cb_src = (SERVER / "pipeline" / "cases_build.py").read_text(encoding="utf-8")
+    check("cases_build 读 snap 一律按 src 过滤", cb_src.count("_SRC_COND") >= 4)
+    check("latest_prices 取「最新有效价」而不是最新一行", "sell > 0" in cb_src)
+    check("按天划界用 BEIJING，不再裸 date.today()",
+          "= date.today()" not in cb_src and "datetime.now(BEIJING).date()" in cb_src)
+    check("逐日稀有度覆盖整个训练窗口（1200 天），不再是随手一个 420",
+          "lookback_days = 1200" in cb_src and "lookback_days: int = 420" not in cb_src)
+    check("被跳过的箱子要喊出来（否则静默退回静态稀有度 = 前视泄漏）",
+          "没写进 case_history" in cb_src)
+
+    # ---- 6) 常驻挂单量采集必须每批上报进度 ----
+    # 踩过的坑：collect_listings 是常驻循环、永不返回，listings.py 只在启动时写一次
+    # running/done=0、那句 finish() 永远到不了 → 看板进度条永久停在 0%。
+    calls: list[dict] = []
+
+    class _FakeProgress:
+        @staticmethod
+        def report(task, status, force=False, **fields):    # noqa: ANN001, ANN202
+            calls.append({"task": task, "status": status, **fields})
+
+    real_load = collector._load_progress
+    real_fetch = collector.fetch_prices
+    real_write = collector.write_daily_snapshot
+    collector._load_progress = lambda: _FakeProgress       # type: ignore[assignment]
+    collector.fetch_prices = (lambda chunk, key, session=None, interval=0: [
+        {"marketHashName": n, "dataList": [{"platform": "BUFF", "sellPrice": 1.0,
+                                            "sellCount": 1, "updateTime": 1791806400}]}
+        for n in chunk])
+    collector.write_daily_snapshot = (lambda con, blocks, date, prefer=None: 1)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            con = collector.connect(Path(td) / "l.db")
+            names = [f"item{i}" for i in range(250)]
+            collector.collect_listings(con, None, "k", names, interval=0, max_batches=3)
+            con.close()
+    finally:
+        collector._load_progress = real_load               # type: ignore[assignment]
+        collector.fetch_prices = real_fetch                # type: ignore[assignment]
+        collector.write_daily_snapshot = real_write        # type: ignore[assignment]
+
+    check("挂单量采集每批都上报进度", len(calls) >= 3, f"{len(calls)} 次上报")
+    # 第一次上报的是「恢复出来的游标」（重启后不从头来），之后每批一个；
+    # 250 个品种、每批 100 → 100 / 200 / 250（正好走完一轮）
+    check("上报的游标真的在往前走（进度条不再是 0/8417）",
+          [c.get("done") for c in calls[1:4]] == [100, 200, 250],
+          str([c.get("done") for c in calls]))
+    check("带上总量与速率（剩余分钟数才有意义）",
+          all(c.get("total") == 250 for c in calls)
+          and calls[-1].get("rate_per_min") is not None)
+    lst = (SERVER / "pipeline" / "listings.py").read_text(encoding="utf-8")
+    check("listings.py 不再只写一次 running/done=0 就撒手",
+          "进度上报交给 collect_listings" in lst)
+
+    # ---- 7) 很久没上报 = 进程已经死了，看板必须说得出来 ----
+    app = (SERVER / "app.py").read_text(encoding="utf-8")
+    check("/api/progress 由服务器算 age_seconds（前端比时钟会受时钟漂移影响）",
+          "age_seconds" in app)
+    api_ts = (SERVER.parent / "web" / "src" / "lib" / "api.ts").read_text(encoding="utf-8")
+    check("前端类型带 age_seconds", "age_seconds" in api_ts)
+    panel = (SERVER.parent / "web" / "src" / "components" / "ProgressPanel.tsx").read_text(
+        encoding="utf-8")
+    check("进度面板把「很久没上报」的任务标成疑似中断（而不是显示 RUNNING）",
+          "疑似中断" in panel and "isStale" in panel and "STALE" in panel)
+    check("挂单量采集有中文标签（原先掉到英文裸键）", "挂单量采集" in panel)
+
+    # ---- 8) --dry-run 必须「什么也不改」----
+    check("dry-run 不再跑采集（原先 84 分钟还顺手写 snap/kline）", "elif dry_run:" in rd)
+    check("dry-run 不上报进度（progress.report 会写库并推送各通道）",
+          rd.count("if not dry_run:") >= 3)
+    check("dry-run 不落盘模型（原先一次实验性重训就覆盖线上 model.pkl）",
+          "persist=not dry_run" in rd)
+    sig = inspect.signature(run_daily.load_or_train).parameters
+    check("load_or_train 有 persist 开关且默认落盘",
+          "persist" in sig and sig["persist"].default is True)
+
+
 def main() -> int:
     print("=" * 62)
     print("回归测试：每条对应一个真实踩过的坑")
@@ -1633,6 +1845,7 @@ def main() -> int:
     test_case_rarity_by_day_no_lookahead()
     test_push_replace_semantics()
     test_misc_hardening()
+    test_review_9_fixes()
     print("\n" + "=" * 62)
     if FAIL:
         print(f"结果：{len(FAIL)} 项失败 → {FAIL}")

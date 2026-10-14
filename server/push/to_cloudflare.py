@@ -79,13 +79,24 @@ def push(
         replace_all: 整表替换（只允许「当前截面」型表，见 Worker 的 REPLACE_ALL_STAGES）
     """
     rows = list(rows)
-    if not rows:
+    has_replace = bool(replace_all or replace_date or replace_series
+                       or replace_since_ts is not None)
+    if not rows and not has_replace:
         log.info("stage=%s 无数据，跳过", stage)
         return 0
 
+    # ⚠️ rows 为空但带 replace_* 时**必须照发**（审查 9 发现）：
+    # 「本轮没有行」≠「本轮不该有行」。原先这里直接 return，
+    # 于是 alerts 的 replaceSince、forecast 的 replaceDate、
+    # factor_latest 的 replaceAll 在空批次下全部丢失 ——
+    # 本地已经撤回的告警/建议会在云端继续挂着（本地那句 DELETE 是无条件的）。
+    # 空行也要发，Worker 侧同样要先删后插（见 ingest.ts 的同款注释）。
     inserted = 0
-    total_chunks = (len(rows) + CHUNK - 1) // CHUNK
-    for i in range(0, len(rows), CHUNK):
+    total_chunks = max(1, (len(rows) + CHUNK - 1) // CHUNK)
+    # range 在 len(rows)==0 时是空的 —— 所以空批次必须单独发一次，
+    # 否则「只删不插」这个语义根本到不了 Worker。
+    offsets = list(range(0, len(rows), CHUNK)) or [0]
+    for i in offsets:
         chunk = rows[i : i + CHUNK]
         # replace_* 只在第一块传，避免重复删除
         first = i == 0
@@ -100,7 +111,10 @@ def push(
             payload["replaceAll"] = True
         res = _post(payload)
         inserted += int(res.get("inserted", 0))
-        log.info("stage=%s 分块 %d/%d 写入 %d 行", stage, i // CHUNK + 1, total_chunks, res.get("inserted", 0))
+        if chunk:
+            log.info("stage=%s 分块 %d/%d 写入 %d 行", stage, i // CHUNK + 1, total_chunks, res.get("inserted", 0))
+        else:
+            log.info("stage=%s 空批次：只执行 replace_* 删除（删 %s 行）", stage, res.get("deleted"))
 
     log.info("stage=%s 完成，共写入 %d 行", stage, inserted)
     return inserted

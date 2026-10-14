@@ -42,7 +42,7 @@ except ImportError:
     pass
 
 from . import collector
-from .config import CFG
+from .config import BEIJING, CFG
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)-10s %(message)s",
                     datefmt="%H:%M:%S")
@@ -60,6 +60,19 @@ def base_name(n: str | None) -> str:
     return _WEAR.sub("", (n or "").strip()).strip()
 
 
+#: 平台口径 —— 与 collector.load_history **完全同一套**：只认 BUFF 与「加 src 列之前」的历史行。
+#:
+#: 非 BUFF 行是**设计上存在**的：BUFF 缺失时 pick_platform 会回退到 C5/YOUPIN，
+#: 并把真实平台记进 snap.src（collector.write_daily_snapshot 还会 log.warning）。
+#: 它们可以留在库里供诊断，但**不许进模型** —— 混口径会在同一列里制造人工跳价。
+#:
+#: 审查 9 发现：本文件四处 SQL 直接读 snap、完全不看 src，而 case_rarity_score
+#: 正是 FEATURE_COLS / MONOTONE 里的模型特征 —— 等于把别的平台的价差当成
+#: 「这个箱子变稀有了」喂进模型；而同一时刻 load_history 把这些行当「没有价格」
+#: 丢掉，于是价格序列与稀有度特征来自两个不同的样本集合。
+_SRC_COND = "(snap.src IS NULL OR snap.src = ?)"
+
+
 # ---------------------------------------------------------------- 数据读取
 def load_cases(path: Path = CRATES) -> list[dict[str, Any]]:
     if not path.exists():
@@ -69,22 +82,44 @@ def load_cases(path: Path = CRATES) -> list[dict[str, Any]]:
 
 
 def latest_prices(con: sqlite3.Connection) -> dict[str, float]:
-    """每个品种的最新价格"""
-    rows = con.execute("""
-        SELECT s.item_id, s.sell
-          FROM snap s
-          JOIN (SELECT item_id, MAX(date) AS d FROM snap GROUP BY item_id) m
-            ON m.item_id = s.item_id AND m.d = s.date
-         WHERE s.sell IS NOT NULL
-    """).fetchall()
+    """每个品种的最新**有效**价格。
+
+    ⚠️ 两处口径（审查 9 发现），缺一个都会让箱子稀有度算错：
+
+    1) 必须按 src 过滤（见 _SRC_COND）。回退平台的报价若被当成箱价，
+       会经由 case_rarity_score 直接进模型。
+    2) 取「最新那一行」不够，必须取「最新一行**有正价格**」：
+       write_daily_snapshot 遇到无效报价（0 / 负数 / 非有限）会**故意**
+       把 sell 写成 NULL 而保留整行（挂单量仍然有效），而当天没有在售价时
+       sellPrice 往往正好是 0。于是「最新一行的 sell 是 NULL」会得到
+       「这个箱子完全没有价格」→ 稀有度里 0~45 分的箱价分量整块消失
+       → 箱子被静默挤出 case_rarity_min=60 的筛选（整箱品种从看板消失）。
+       这正是「把数据缺失当不合格」那个栽过两次的坑，而 price_trend 早就是对的。
+    """
+    rows = con.execute(
+        f"""
+        SELECT snap.item_id, snap.sell
+          FROM snap
+          JOIN (SELECT item_id, MAX(date) AS d FROM snap
+                 WHERE sell > 0 AND {_SRC_COND}
+                 GROUP BY item_id) m
+            ON m.item_id = snap.item_id AND m.d = snap.date
+         WHERE snap.sell > 0 AND {_SRC_COND}
+        """,
+        [collector.PRICE_PLATFORM] * 2,
+    ).fetchall()
     return {r[0]: float(r[1]) for r in rows}
 
 
 def price_trend(con: sqlite3.Connection, item_id: str, days: int = 30) -> float | None:
-    """近 N 日价格变化率（拿不到成交量时用它代理开箱热度衰减）"""
+    """近 N 日价格变化率（拿不到成交量时用它代理开箱热度衰减）
+
+    与 latest_prices 同一套口径：只认 BUFF（src 过滤）+ 只取正价格。
+    """
     rows = con.execute(
-        "SELECT sell FROM snap WHERE item_id = ? AND sell IS NOT NULL ORDER BY date DESC LIMIT ?",
-        (item_id, days),
+        f"SELECT sell FROM snap WHERE item_id = ? AND sell > 0 AND {_SRC_COND}"
+        " ORDER BY date DESC LIMIT ?",
+        (item_id, collector.PRICE_PLATFORM, days),
     ).fetchall()
     if len(rows) < 5:
         return None
@@ -152,7 +187,10 @@ def infer_drop_pool(case_price: float | None, age_years: float) -> str:
 def build(con: sqlite3.Connection) -> tuple[list[dict], dict[str, str], dict[str, str]]:
     cases = load_cases()
     prices = latest_prices(con)
-    today = date.today()
+    # ⚠️ 按天划界一律用北京时间（不变量 1）。裸 date.today() 用的是服务器本地时区，
+    # 服务器一旦不是 +08，年龄分量与历史窗口就会整体偏一天（审查 9 发现：
+    # 上一轮刚把 collect_listings 的裸 datetime.now() 修掉，这里漏了）。
+    today = datetime.now(BEIJING).date()
 
     # 箱子 → 物品（本地 item_id 列表）
     items_by_case: dict[str, list[str]] = defaultdict(list)
@@ -250,7 +288,8 @@ CREATE INDEX IF NOT EXISTS ix_case_history ON case_history(case_id, date);
 """
 
 
-def build_history(con: sqlite3.Connection, cases: list[dict], lookback_days: int = 420) -> int:
+def build_history(con: sqlite3.Connection, cases: list[dict],
+                  lookback_days: int | None = None) -> int:
     """按**每个交易日**复算箱子稀有度，写进 case_history。
 
     为什么必须这么做（审查发现的前视泄漏）：
@@ -266,10 +305,19 @@ def build_history(con: sqlite3.Connection, cases: list[dict], lookback_days: int
     不能传 build() 的输出 —— 那个输出里没有这两个字段，传错的话年龄恒为 0、
     箱内中位价恒为 None，分数会系统性偏低约 40 分（实测踩过：85 分算成 45 分）。
 
+    lookback_days 默认取**训练窗口长度**（collector.load_history 的 days，默认 1200），
+    不是随手一个 420（审查 9 发现）：run_daily 用 1200 天历史训练，而 case_history
+    只复算 420 天，于是窗口更早的那段日期在 features.build 里 merge 不上
+    （features 的口径是「命中就用逐日值，没命中就退回静态值」）——
+    静默退回「今天算的」静态稀有度，前视泄漏原样回来了，而且没有任何告警。
+    线上库现在只有约 366 天历史，所以这个缺口暂时是 0，但它每天 +1。
+
     返回写入行数。
     """
     con.executescript(CASE_HISTORY_SCHEMA)
-    cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+    if lookback_days is None:
+        lookback_days = 1200      # 与 collector.load_history 的默认窗口保持一致
+    cutoff = (datetime.now(BEIJING).date() - timedelta(days=lookback_days)).isoformat()
 
     # 箱子 → 物品（本地 item_id），沿用 build() 的口径
     item_rows = con.execute("SELECT item_id, market_hash_name FROM items").fetchall()
@@ -278,6 +326,7 @@ def build_history(con: sqlite3.Connection, cases: list[dict], lookback_days: int
         by_base[base_name(mhn or item_id)].append(item_id)
 
     total = 0
+    skipped: list[str] = []
     con.execute("DELETE FROM case_history WHERE date >= ?", (cutoff,))
     for c in cases:
         cid = c.get("case_id") or c.get("market_hash_name")
@@ -289,13 +338,16 @@ def build_history(con: sqlite3.Connection, cases: list[dict], lookback_days: int
             if b:
                 ids.extend(by_base.get(b, []))
         if not ids:
+            skipped.append(f"{cid}(箱内物品匹配不到 items)")
             continue
 
-        # 箱价序列
+        # 箱价序列（平台口径与 latest_prices 一致）
         box = pd.read_sql_query(
-            "SELECT date, sell AS price FROM snap WHERE item_id = ? AND sell > 0 "
-            " AND date >= ? ORDER BY date", con, params=(cid, cutoff))
+            f"SELECT date, sell AS price FROM snap WHERE item_id = ? AND sell > 0 "
+            f" AND {_SRC_COND} AND date >= ? ORDER BY date", con,
+            params=(cid, collector.PRICE_PLATFORM, cutoff))
         if box.empty:
+            skipped.append(f"{cid}(窗口内无有效箱价)")
             continue
         box["date"] = pd.to_datetime(box["date"])
         box = box.drop_duplicates("date").set_index("date")["price"].astype(float)
@@ -306,7 +358,8 @@ def build_history(con: sqlite3.Connection, cases: list[dict], lookback_days: int
         ph = ",".join(["?"] * len(ids))
         ip = pd.read_sql_query(
             f"SELECT date, sell AS price FROM snap WHERE item_id IN ({ph}) "
-            f" AND sell > 0 AND date >= ?", con, params=ids + [cutoff])
+            f" AND sell > 0 AND {_SRC_COND} AND date >= ?", con,
+            params=ids + [collector.PRICE_PLATFORM, cutoff])
         if not ip.empty:
             ip["date"] = pd.to_datetime(ip["date"])
             med = ip.groupby("date")["price"].median()
@@ -345,6 +398,13 @@ def build_history(con: sqlite3.Connection, cases: list[dict], lookback_days: int
             total += len(rows)
             con.commit()
     log.info("case_history 写入 %d 行（%d 个箱子的逐日稀有度）", total, len(cases))
+    if skipped:
+        # ⚠️ 必须喊出来：被跳过的箱子在整个窗口内没有任何 case_history 行，
+        # 而 features.build 的口径是「命中就用逐日值，没命中就退回 case_meta 的静态值」
+        # —— 也就是悄悄退回「今天算的」稀有度（前视泄漏）。这种沉默的退化
+        # 只能靠这行日志被发现。
+        log.warning("有 %d 个箱子没写进 case_history（训练集里会退回静态稀有度）：%s",
+                    len(skipped), "；".join(skipped[:8]) + ("…" if len(skipped) > 8 else ""))
     return total
 
 

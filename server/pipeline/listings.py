@@ -109,12 +109,13 @@ def main() -> int:
         log.error("监控池为空，先跑 base 同步")
         return 3
 
-    if task_progress:
-        try:
-            task_progress.report("listings", "running", force=True, total=len(names), done=0,
-                                 message=f"挂单量采集 {len(names)} 个品种")
-        except Exception:
-            pass
+    # ⚠️ 进度上报交给 collect_listings（审查 9 发现）。
+    # 原先这里只写一次 running/done=0 就再无下文：常驻循环**永远不返回**，
+    # 所以下面那句 finish() 在线上一次都没执行过 —— 看板上「挂单量采集」
+    # 的进度条永久停在 0%、速率/剩余显示「—」，既看不出它活着，
+    # 也看不出它死了。现在由采集循环每批上报真实游标。
+    if not task_progress:
+        log.warning("进度模块不可用：看板上的挂单量进度不会更新（采集不受影响）")
 
     try:
         stats = collector.collect_listings(

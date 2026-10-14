@@ -133,12 +133,16 @@ ingestRoutes.post('/ingest', async (c) => {
   if (!stage) return fail(`unknown stage: ${stageName} (allowed: ${Object.keys(STAGES).join(', ')})`, 400);
 
   const rows = Array.isArray(body.rows) ? body.rows : [];
-  if (rows.length === 0) return ok({ inserted: 0 });
 
   const db = c.env.DB;
   let deleted = 0;
 
-  // 整表替换：用于「当前截面」这类表（见 REPLACE_ALL_STAGES 的说明）
+  // ⚠️ 空批次也必须走完下面的删除（审查 9 发现）。
+  // 「本轮没有行」≠「本轮不该有行」：原先 `rows.length === 0` 在这里直接返回，
+  // 于是 alerts 的 replaceSince / forecast 的 replaceDate / factor_latest 的
+  // replaceAll 在空批次下全部丢失 —— 服务器本地已经撤回的告警与买入建议
+  // 会在 D1 里继续挂着，两个看板各说各话。
+  // 现在顺序是「先删 → 再看有没有行要插」。
   if (body.replaceAll === true) {
     if (!REPLACE_ALL_STAGES.has(stageName)) {
       return fail(`stage ${stageName} 不支持 replaceAll`, 400);
@@ -169,11 +173,13 @@ ingestRoutes.post('/ingest', async (c) => {
 
   const stmt = insertSql(stage);
   let inserted = 0;
-  for (let i = 0; i < rows.length; i += BATCH_MAX) {
-    const chunk = rows.slice(i, i + BATCH_MAX) as Record<string, unknown>[];
-    const prepared = chunk.map((r) => db.prepare(stmt).bind(...rowToBind(r, stage)));
-    const results = await db.batch(prepared);
-    for (const res of results) inserted += res.meta.changes ?? 0;
+  if (rows.length > 0) {
+    for (let i = 0; i < rows.length; i += BATCH_MAX) {
+      const chunk = rows.slice(i, i + BATCH_MAX) as Record<string, unknown>[];
+      const prepared = chunk.map((r) => db.prepare(stmt).bind(...rowToBind(r, stage)));
+      const results = await db.batch(prepared);
+      for (const res of results) inserted += res.meta.changes ?? 0;
+    }
   }
 
   await db

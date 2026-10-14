@@ -521,6 +521,20 @@ def _meta_set(con: sqlite3.Connection, k: str, v: str) -> None:
         log.warning("游标保存失败（%s=%s）：%s —— 本轮继续，下次会从旧位置重跑", k, v, e)
 
 
+def _load_progress():
+    """惰性加载 push.progress —— 前端进度是锦上添花，缺了也要能跑。"""
+    try:
+        import os as _os
+        import sys as _sys
+        _srv = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        if _srv not in _sys.path:
+            _sys.path.insert(0, _srv)
+        from push import progress as _prog  # type: ignore
+        return _prog
+    except Exception:
+        return None
+
+
 def collect_listings(
     con: sqlite3.Connection,
     session: requests.Session,
@@ -559,12 +573,44 @@ def collect_listings(
         cur = 0
         log.info("挂单量采集：上一轮已走完，从头发起新一轮（%d 个品种）", len(names))
 
+    # ---- 进度上报（审查 9 发现）----
+    # 这是个**常驻**循环：listings.py 只在启动时写一次 running/done=0，
+    # 而 collect_listings 跑到天荒地老也不会返回 —— 那句 finish() 永远到不了。
+    # 于是看板上「挂单量采集」的进度条永远停在 0%、速率与剩余显示「—」，
+    # 而采集器其实每分钟都在往前走。这是「看板说谎」：
+    # 既看不出它活着，也看不出它死了（行一直显示 running）。
+    # 现在每批上报真实游标，进度条才与现实对得上。
+    _prog = _load_progress()
+    _t0 = time.time()            # 本次进程起点：用于算真实速率
+    _started_at = int(_t0)       # 展示用的「开始时间」
+
+    def _report(done: int, message: str | None = None) -> None:
+        if not _prog:
+            return
+        elapsed = max(time.time() - _t0, 1e-6)
+        rate = stats["items"] / elapsed * 60.0     # 个/分钟：本次进程真正发出的量
+        remaining = max(len(names) - done, 0)
+        try:
+            _prog.report(
+                "listings", "running", total=len(names), done=done,
+                fail=stats["fail"], rows=stats["rows"],
+                rate_per_min=round(rate, 1),
+                eta_minutes=round(remaining / rate, 1) if rate > 0 else None,
+                started_at=_started_at,
+                message=message or f"常驻循环 · 游标 {done}/{len(names)}",
+            )
+        except Exception as e:      # noqa: BLE001
+            log.debug("挂单量进度上报失败（不影响采集）：%s", e)
+
+    _report(cur)     # 重启后立刻把真实游标亮出来，别让看板停在 0%
+
     n_chunks = (len(names) + BATCH_MAX - 1) // BATCH_MAX
     while stats["batches"] < (max_batches or n_chunks * 10**6):
         if cur >= len(names):
             log.info("挂单量采集：一轮结束（%d 个品种 / %d 批），从头发起新一轮",
                      len(names), n_chunks)
             cur = 0
+            _started_at = int(time.time())
         chunk = names[cur : cur + BATCH_MAX]
         if not chunk:
             break
@@ -596,6 +642,7 @@ def collect_listings(
             pct = cur / len(names) * 100
             log.info("  挂单量 %d/%d（%.1f%%，第 %d 批，累计写入 %d 行）",
                      cur, len(names), pct, stats["batches"], stats["rows"])
+        _report(cur)      # 每批都报：进度条、速率、剩余分钟数才有意义
         time.sleep(interval)
 
     return stats
@@ -811,16 +858,7 @@ def collect_daily_kline(
     import time as _time
 
     # 进度上报（前端实时查看）；导入失败不影响采集
-    _prog = None
-    try:
-        import os as _os
-        import sys as _sys
-        _srv = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-        if _srv not in _sys.path:
-            _sys.path.insert(0, _srv)
-        from push import progress as _prog  # type: ignore
-    except Exception:
-        _prog = None
+    _prog = _load_progress()
 
     stats = {"ok": 0, "empty": 0, "fail": 0, "rows": 0}
     t0 = _time.time()
