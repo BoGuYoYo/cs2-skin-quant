@@ -34,14 +34,22 @@ function FactorRow({
   value,
   unit = 'num',
   hint,
+  scaleMax,
 }: {
   label: string;
   value: number | null;
-  unit?: 'num' | 'pct' | 'logpct';
+  unit?: 'num' | 'pct' | 'logpct' | 'pctnum';
   hint?: string;
+  scaleMax?: number;
 }) {
-  const shown = unit === 'pct' ? pct(value, 2) : unit === 'logpct' ? logPct(value, 2) : num(value, 2);
-  const scale = unit === 'pct' ? 100 : unit === 'logpct' ? 100 : 20;
+  const shown = unit === 'pct' ? pct(value, 2)
+    : unit === 'logpct' ? logPct(value, 2)
+      : unit === 'pctnum' ? (value === null ? '—' : `${value.toFixed(2)}%`)
+        : num(value, 2);
+  const scale = unit === 'pct' ? 100
+    : unit === 'logpct' ? 100
+      : unit === 'pctnum' ? 1
+        : scaleMax ?? 20;
   return (
     <div className="factor-row">
       <span className="lab">{label}</span>
@@ -158,10 +166,10 @@ export default function ItemDetail() {
           </div>
           <div style={{ marginTop: 12 }}>
             <FactorRow label="存世量同箱分位" value={f?.supply_peer_pct ?? null} unit="pct" />
-            <FactorRow label="供给刚性（合成）" value={f?.supply_rigidity ?? null} />
+            <FactorRow label="供给刚性（合成）" value={f?.supply_rigidity ?? null} scaleMax={100} />
             <FactorRow label="换手率" value={f?.turnover ?? null} unit="pct" />
             <FactorRow label="在售 / 存世" value={f?.list_ratio ?? null} unit="pct" />
-            <FactorRow label="挂单量 7 日变化" value={f?.list_slope_7d ?? null} />
+            <FactorRow label="挂单量 7 日变化" value={f?.list_slope_7d ?? null} unit="pctnum" />
           </div>
           {cm?.rationale ? (
             <div className="ark-note" style={{ marginTop: 12, marginBottom: 0 }}>
@@ -204,11 +212,15 @@ export default function ItemDetail() {
           <div className="grid g2" style={{ marginTop: 12 }}>
             <div>
               <div className="dim" style={{ fontSize: 12 }}>看空事件（30日）</div>
-              <div className="mono neg" style={{ fontSize: 16 }}>{int(f?.event_bearish_30d ?? 0)}</div>
+              <div className={`mono ${f?.event_bearish_30d == null ? 'dim' : 'neg'}`} style={{ fontSize: 16 }}>
+                {int(f?.event_bearish_30d)}
+              </div>
             </div>
             <div>
               <div className="dim" style={{ fontSize: 12 }}>看多事件（30日）</div>
-              <div className="mono pos" style={{ fontSize: 16 }}>{int(f?.event_bullish_30d ?? 0)}</div>
+              <div className={`mono ${f?.event_bullish_30d == null ? 'dim' : 'pos'}`} style={{ fontSize: 16 }}>
+                {int(f?.event_bullish_30d)}
+              </div>
             </div>
           </div>
         </div>

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../lib/api';
 import { useApi } from '../lib/useApi';
@@ -8,25 +8,58 @@ import { int, money, pct, num, logPct, rarityTone } from '../lib/format';
 
 type Mode = 'pool' | 'screener';
 
+function useDebounced<T>(value: T, delay = 300): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const id = window.setTimeout(() => setDebounced(value), delay);
+    return () => window.clearTimeout(id);
+  }, [value, delay]);
+  return debounced;
+}
+
+function filterNumber(v: string): number | null {
+  if (v.trim() === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 export default function Candidates() {
   const [mode, setMode] = useState<Mode>('pool');
   const [sort, setSort] = useState('score');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
   const [side, setSide] = useState('');
   const [limit, setLimit] = useState(100);
 
   // 经验法则默认值：≤100 元、换手 ≥0.2%、在售占比 ≤3.5%、箱稀有度 ≥60
-  const [priceMax, setPriceMax] = useState(100);
-  const [turnoverMin, setTurnoverMin] = useState(0.2);
-  const [listRatioMax, setListRatioMax] = useState(3.5);
-  const [rarityMin, setRarityMin] = useState(60);
+  const [priceMax, setPriceMax] = useState('100');
+  const [turnoverMin, setTurnoverMin] = useState('0.2');
+  const [listRatioMax, setListRatioMax] = useState('3.5');
+  const [rarityMin, setRarityMin] = useState('60');
+  const filters = {
+    priceMax: filterNumber(priceMax),
+    turnoverMin: filterNumber(turnoverMin),
+    listRatioMax: filterNumber(listRatioMax),
+    rarityMin: filterNumber(rarityMin),
+  };
+  const debouncedFilters = useDebounced(filters, 350);
+  const validFilters = Object.values(debouncedFilters).every((v) => v !== null);
 
   const pool = useApi(
-    () => api.candidates({ sort, side, limit }),
-    [sort, side, limit],
+    () => api.candidates({ sort, dir: sortDir, side, limit }),
+    [sort, sortDir, side, limit],
   );
   const scr = useApi(
-    () => api.screener({ priceMax, turnoverMin: turnoverMin / 100, listRatioMax: listRatioMax / 100, rarityMin, limit }),
-    [priceMax, turnoverMin, listRatioMax, rarityMin, limit],
+    () => validFilters
+      ? api.screener({
+          priceMax: debouncedFilters.priceMax!,
+          turnoverMin: debouncedFilters.turnoverMin! / 100,
+          listRatioMax: debouncedFilters.listRatioMax! / 100,
+          rarityMin: debouncedFilters.rarityMin!,
+          limit,
+        })
+      : Promise.resolve([]),
+    [validFilters, debouncedFilters.priceMax, debouncedFilters.turnoverMin,
+     debouncedFilters.listRatioMax, debouncedFilters.rarityMin, limit],
   );
 
   return (
@@ -83,19 +116,19 @@ export default function Candidates() {
           <>
             <label>
               价格上限
-              <input type="number" value={priceMax} onChange={(e) => setPriceMax(+e.target.value)} />
+              <input type="number" value={priceMax} onChange={(e) => setPriceMax(e.target.value)} />
             </label>
             <label>
               换手率 ≥ %
-              <input type="number" step="0.05" value={turnoverMin} onChange={(e) => setTurnoverMin(+e.target.value)} />
+              <input type="number" step="0.05" value={turnoverMin} onChange={(e) => setTurnoverMin(e.target.value)} />
             </label>
             <label>
               在售占比 ≤ %
-              <input type="number" step="0.1" value={listRatioMax} onChange={(e) => setListRatioMax(+e.target.value)} />
+              <input type="number" step="0.1" value={listRatioMax} onChange={(e) => setListRatioMax(e.target.value)} />
             </label>
             <label>
               箱稀有度 ≥
-              <input type="number" value={rarityMin} onChange={(e) => setRarityMin(+e.target.value)} />
+              <input type="number" value={rarityMin} onChange={(e) => setRarityMin(e.target.value)} />
             </label>
           </>
         )}
@@ -118,7 +151,14 @@ export default function Candidates() {
           <CandidateTable
             rows={pool.data?.rows ?? []}
             sortKey={sort}
-            onSort={(k) => setSort(k === 'price' ? 'q10' : k)}
+            sortDir={sortDir}
+            onSort={(k) => {
+              if (k === sort) setSortDir((d) => d === 'desc' ? 'asc' : 'desc');
+              else {
+                setSort(k);
+                setSortDir('desc');
+              }
+            }}
           />
         </State>
       ) : (
@@ -145,7 +185,7 @@ export default function Candidates() {
                   <tr key={r.item_id}>
                     <td>
                       <Link to={`/item/${encodeURIComponent(r.item_id)}`} className="item-cell">
-                        {r.image ? <img src={r.image} alt="" loading="lazy" /> : <img alt="" />}
+                        {r.image ? <img src={r.image} alt="" loading="lazy" /> : null}
                         <span>
                           <span className="nm">{r.name ?? r.item_id}</span>
                           {r.case_name ? <span className="cs"> · {r.case_name}</span> : null}

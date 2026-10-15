@@ -13,6 +13,7 @@ export function KLine({ data, height = 380, ma = true }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  const volumeRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const maRefs = useRef<ISeriesApi<'Line'>[]>([]);
 
   useEffect(() => {
@@ -33,15 +34,26 @@ export function KLine({ data, height = 380, ma = true }: Props) {
       },
       crosshair: { mode: CrosshairMode.Normal },
       rightPriceScale: { borderColor: '#232c3d' },
+      leftPriceScale: { visible: false },
       timeScale: { borderColor: '#232c3d', rightOffset: 4 },
     });
 
+    chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.08, bottom: 0.28 } });
     candleRef.current = chart.addCandlestickSeries({
       upColor: '#2ecc8f',
       downColor: '#ff5c5c',
       wickUpColor: '#2ecc8f',
       wickDownColor: '#ff5c5c',
       borderVisible: false,
+    });
+    volumeRef.current = chart.addHistogramSeries({
+      priceFormat: { type: 'volume' },
+      priceScaleId: 'volume',
+      priceLineVisible: false,
+      lastValueVisible: false,
+    });
+    chart.priceScale('volume').applyOptions({
+      scaleMargins: { top: 0.78, bottom: 0 },
     });
 
     maRefs.current = [];
@@ -67,6 +79,7 @@ export function KLine({ data, height = 380, ma = true }: Props) {
       chart.remove();
       chartRef.current = null;
       candleRef.current = null;
+      volumeRef.current = null;
       maRefs.current = [];
     };
   }, [height, ma]);
@@ -75,6 +88,15 @@ export function KLine({ data, height = 380, ma = true }: Props) {
     if (!candleRef.current || data.length === 0) return;
     candleRef.current.setData(
       data.map((d) => ({ time: d.date, open: d.o, high: d.h, low: d.l, close: d.c })),
+    );
+    volumeRef.current?.setData(
+      data
+        .filter((d) => d.v !== null)
+        .map((d) => ({
+          time: d.date,
+          value: d.v as number,
+          color: d.c >= d.o ? 'rgba(46,204,143,0.45)' : 'rgba(255,92,92,0.45)',
+        })),
     );
     if (maRefs.current.length === 4) {
       const periods = [5, 10, 30, 60];

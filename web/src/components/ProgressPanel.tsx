@@ -165,9 +165,9 @@ export function ProgressPanel() {
                 <div>
                   <dt>空 / 失败</dt>
                   <dd>
-                    <span className="ark-dim">{r.empty ?? 0}</span>
+                    <span className="ark-dim">{r.empty ?? '—'}</span>
                     {' / '}
-                    <span className={(r.fail ?? 0) > 0 ? 'ark-neg' : 'ark-dim'}>{r.fail ?? 0}</span>
+                    <span className={(r.fail ?? 0) > 0 ? 'ark-neg' : 'ark-dim'}>{r.fail ?? '—'}</span>
                   </dd>
                 </div>
                 <div>
@@ -206,7 +206,7 @@ export function ProgressStrip() {
     const load = async () => {
       try {
         const data = await api.progress();
-        if (alive) setRows(data.filter((r) => r.status === 'running'));
+        if (alive) setRows(data.filter((r) => r.status === 'running' && !isStale(r)));
       } catch {
         /* topbar 状态不报错 */
       }

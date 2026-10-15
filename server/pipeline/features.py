@@ -174,14 +174,21 @@ def build(
         df["rel_ret_7d"] = df["ret_7d"] - df["mkt_7"].fillna(0)
         df["rel_ret_21d"] = df["ret_21d"] - df["mkt_21"].fillna(0)
     else:
-        df["rel_ret_7d"] = df["ret_7d"]
-        df["rel_ret_21d"] = df["ret_21d"]
+        # 没有大盘序列时，「相对大盘」是未知，不是「相对自己」。
+        # 用自身收益顶替会让前端显示同一个数，还会让 decide 把跌幅重复计两次。
+        df["rel_ret_7d"] = np.nan
+        df["rel_ret_21d"] = np.nan
 
     # ------------------------------------------------------- LLM 事件特征
-    df["event_bearish_30d"] = 0
-    df["event_bullish_30d"] = 0
-    df["event_conf_max"] = 0.0
+    # events 表没有生产者时，事件数是未知而不是零。只有真正读到事件源后，
+    # 才把滚动窗口内没有命中的日期填成 0。
+    df["event_bearish_30d"] = np.nan
+    df["event_bullish_30d"] = np.nan
+    df["event_conf_max"] = np.nan
     if events_df is not None and not events_df.empty:
+        df["event_bearish_30d"] = 0
+        df["event_bullish_30d"] = 0
+        df["event_conf_max"] = 0.0
         ev = events_df.copy()
         ev["date"] = pd.to_datetime(ev["date"])
         ev = ev[ev["direction"].isin(("bullish", "bearish"))]
@@ -231,13 +238,17 @@ def build(
         df["ret_30d"].notna() & df["dd_from_high"].notna() & df["vol_21"].notna()
     )
 
-    # 按品种前向填充，残余 NaN 归零 —— 保证推理阶段永远拿到完整向量。
+    # 按品种前向填充，残余 NaN 归零。相对大盘例外：
+    # 没有指数时它必须保持 NaN，既让 LightGBM 按缺失值处理，
+    # 也让前端显示「—」而不是伪造一个「与大盘持平」的 0。
     # 注意 1：fillna 发生在 is_warm 计算之后，所以预热期样本仍会被标记为不可用。
     # 注意 2：只填 FEATURE_COLS。FEATURE_COLS_PENDING 里的列**故意留 NaN**——
     #   它们没有真实原料（存世量/成交量/挂单量/事件），填 0 会让前端把「没数据」
     #   显示成「换手率 0.00%」，那正是我们要消灭的那种"看着像模像样"的假数据。
     #   NaN 一路推到前端会渲染成 "—"，这才是诚实的。
     for c in FEATURE_COLS:
+        if c in {"rel_ret_7d", "rel_ret_21d"}:
+            continue
         df[c] = df.groupby("item_id")[c].ffill().fillna(0.0)
 
     # float64 → float32：542 万行 × 38 列，光 dtype 就从 1.6GB 降到 0.8GB。

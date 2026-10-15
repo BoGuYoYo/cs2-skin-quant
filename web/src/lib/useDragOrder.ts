@@ -46,5 +46,17 @@ export function useDragOrder(storageKey: string, defaults: string[]) {
 
   const reset = useCallback(() => setOrder(defaults), [defaults]);
 
-  return { order, move, reset, setOrder };
+  const moveBy = useCallback((id: string, delta: number) => {
+    setOrder((prev) => {
+      const from = prev.indexOf(id);
+      const to = from + delta;
+      if (from < 0 || to < 0 || to >= prev.length) return prev;
+      const next = [...prev];
+      next.splice(from, 1);
+      next.splice(to, 0, id);
+      return next;
+    });
+  }, []);
+
+  return { order, move, moveBy, reset, setOrder };
 }

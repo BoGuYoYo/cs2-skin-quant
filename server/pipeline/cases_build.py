@@ -327,76 +327,85 @@ def build_history(con: sqlite3.Connection, cases: list[dict],
 
     total = 0
     skipped: list[str] = []
-    con.execute("DELETE FROM case_history WHERE date >= ?", (cutoff,))
-    for c in cases:
-        cid = c.get("case_id") or c.get("market_hash_name")
-        if not cid:
-            continue
-        ids: list[str] = []
-        for it in c.get("contains") or []:
-            b = base_name(it.get("name"))
-            if b:
-                ids.extend(by_base.get(b, []))
-        if not ids:
-            skipped.append(f"{cid}(箱内物品匹配不到 items)")
-            continue
 
-        # 箱价序列（平台口径与 latest_prices 一致）
-        box = pd.read_sql_query(
-            f"SELECT date, sell AS price FROM snap WHERE item_id = ? AND sell > 0 "
-            f" AND {_SRC_COND} AND date >= ? ORDER BY date", con,
-            params=(cid, collector.PRICE_PLATFORM, cutoff))
-        if box.empty:
-            skipped.append(f"{cid}(窗口内无有效箱价)")
-            continue
-        box["date"] = pd.to_datetime(box["date"])
-        box = box.drop_duplicates("date").set_index("date")["price"].astype(float)
-        dates = box.index
+    # 整窗重算要么整体成功，要么保留旧版本。原先每个箱子单独 commit，
+    # 中途死掉会留下「窗口内一半箱子没有逐日稀有度」的半成品，
+    # features 随后静默退回今天算的静态值，重新引入前视泄漏。
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        con.execute("DELETE FROM case_history WHERE date >= ?", (cutoff,))
+        for c in cases:
+            cid = c.get("case_id") or c.get("market_hash_name")
+            if not cid:
+                continue
+            ids: list[str] = []
+            for it in c.get("contains") or []:
+                b = base_name(it.get("name"))
+                if b:
+                    ids.extend(by_base.get(b, []))
+            if not ids:
+                skipped.append(f"{cid}(箱内物品匹配不到 items)")
+                continue
 
-        # 箱内物品价格中位数（按日）
-        med = None
-        ph = ",".join(["?"] * len(ids))
-        ip = pd.read_sql_query(
-            f"SELECT date, sell AS price FROM snap WHERE item_id IN ({ph}) "
-            f" AND sell > 0 AND {_SRC_COND} AND date >= ?", con,
-            params=ids + [collector.PRICE_PLATFORM, cutoff])
-        if not ip.empty:
-            ip["date"] = pd.to_datetime(ip["date"])
-            med = ip.groupby("date")["price"].median()
+            # 箱价序列（平台口径与 latest_prices 一致）
+            box = pd.read_sql_query(
+                f"SELECT date, sell AS price FROM snap WHERE item_id = ? AND sell > 0 "
+                f" AND {_SRC_COND} AND date >= ? ORDER BY date", con,
+                params=(cid, collector.PRICE_PLATFORM, cutoff))
+            if box.empty:
+                skipped.append(f"{cid}(窗口内无有效箱价)")
+                continue
+            box["date"] = pd.to_datetime(box["date"])
+            box = box.drop_duplicates("date").set_index("date")["price"].astype(float)
+            dates = box.index
 
-        # 年龄（按天算，随日期变化）
-        fsd = c.get("first_sale_date")
-        first: date | None = None
-        if fsd:
-            for fmt in ("%Y/%m/%d", "%Y-%m-%d"):
-                try:
-                    first = datetime.strptime(fsd, fmt).date()
-                    break
-                except ValueError:
-                    continue
+            # 箱内物品价格中位数（按日）
+            med = None
+            ph = ",".join(["?"] * len(ids))
+            ip = pd.read_sql_query(
+                f"SELECT date, sell AS price FROM snap WHERE item_id IN ({ph}) "
+                f" AND sell > 0 AND {_SRC_COND} AND date >= ?", con,
+                params=ids + [collector.PRICE_PLATFORM, cutoff])
+            if not ip.empty:
+                ip["date"] = pd.to_datetime(ip["date"])
+                med = ip.groupby("date")["price"].median()
 
-        rows = []
-        for d in dates:
-            p = float(box.loc[d])
-            # 趋势：该日往前 30 个采样点（与 cases_build.price_trend 同口径）
-            prior = box.loc[:d]
-            trend = None
-            if len(prior) >= 2:
-                back = float(prior.iloc[0] if len(prior) <= 30 else prior.iloc[-30])
-                if back > 0:
-                    trend = p / back - 1.0
-            age_years = ((d.date() - first).days / 365.25) if first else 0.0
-            item_median = float(med.loc[d]) if (med is not None and d in med.index) else None
-            score, _ = rarity_score(p, age_years, item_median, trend)
-            rows.append((cid, d.strftime("%Y-%m-%d"), score, round(p, 2),
-                         infer_drop_pool(p, age_years)))
-        if rows:
-            con.executemany(
-                "INSERT OR REPLACE INTO case_history "
-                "(case_id, date, rarity_score, case_price, drop_pool) VALUES (?,?,?,?,?)",
-                rows)
-            total += len(rows)
-            con.commit()
+            # 年龄（按天算，随日期变化）
+            fsd = c.get("first_sale_date")
+            first: date | None = None
+            if fsd:
+                for fmt in ("%Y/%m/%d", "%Y-%m-%d"):
+                    try:
+                        first = datetime.strptime(fsd, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+
+            rows = []
+            for d in dates:
+                p = float(box.loc[d])
+                # 趋势：该日往前 30 个采样点（与 cases_build.price_trend 同口径）
+                prior = box.loc[:d]
+                trend = None
+                if len(prior) >= 2:
+                    back = float(prior.iloc[0] if len(prior) <= 30 else prior.iloc[-30])
+                    if back > 0:
+                        trend = p / back - 1.0
+                age_years = ((d.date() - first).days / 365.25) if first else 0.0
+                item_median = float(med.loc[d]) if (med is not None and d in med.index) else None
+                score, _ = rarity_score(p, age_years, item_median, trend)
+                rows.append((cid, d.strftime("%Y-%m-%d"), score, round(p, 2),
+                             infer_drop_pool(p, age_years)))
+            if rows:
+                con.executemany(
+                    "INSERT OR REPLACE INTO case_history "
+                    "(case_id, date, rarity_score, case_price, drop_pool) VALUES (?,?,?,?,?)",
+                    rows)
+                total += len(rows)
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
     log.info("case_history 写入 %d 行（%d 个箱子的逐日稀有度）", total, len(cases))
     if skipped:
         # ⚠️ 必须喊出来：被跳过的箱子在整个窗口内没有任何 case_history 行，

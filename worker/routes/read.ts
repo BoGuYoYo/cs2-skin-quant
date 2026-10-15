@@ -30,6 +30,10 @@ const SORT_COLS: Record<string, string> = {
   turnover: 'fl.turnover',
 };
 
+function beijingDate(ts = Date.now()): string {
+  return new Date(ts + 8 * 3600_000).toISOString().slice(0, 10);
+}
+
 // ---------------------------------------------------------------- 元信息
 readRoutes.get('/meta', async (c) => {
   const data = await withCache(c.env, 'meta', ttl(c.env), async () => {
@@ -46,7 +50,13 @@ readRoutes.get('/meta', async (c) => {
     ]);
     const meta: Record<string, string> = {};
     for (const r of metaRows.results) meta[r.k] = r.v;
-    return { latestForecastDate: day, meta, counts };
+    let latestForecastAgeDays: number | null = null;
+    if (day) {
+      const parsed = Date.parse(`${day}T00:00:00Z`);
+      const today = Date.parse(`${beijingDate()}T00:00:00Z`);
+      if (Number.isFinite(parsed)) latestForecastAgeDays = Math.max(0, Math.round((today - parsed) / 86400_000));
+    }
+    return { latestForecastDate: day, latestForecastAgeDays, meta, counts };
   });
   return ok(data);
 });
@@ -77,6 +87,16 @@ readRoutes.get('/candidates', async (c) => {
   const minRarity = qNum(c.req.query('rarityMin'));
 
   const data = await withCache(c.env, `cand:${date ?? 'latest'}:${limit}:${side ?? ''}:${sortKey}:${dir}:${minRarity ?? ''}`, ttl(c.env), async () => {
+    if (!date) {
+      const metaRows = await c.env.DB.prepare(
+        "SELECT k, v FROM meta WHERE k IN ('last_run', 'no_cross_section_on')",
+      ).all<{ k: string; v: string }>();
+      const marker = metaRows.results.find((r) => r.k === 'no_cross_section_on')?.v ?? '';
+      const lastRun = metaRows.results.find((r) => r.k === 'last_run')?.v ?? '';
+      if (marker && marker === lastRun) {
+        return { date: marker, rows: [], reason: '最近一次运行没有产生有效截面' };
+      }
+    }
     const d = date ?? (await latestDate(c.env.DB, 'forecast'));
     if (!d) return { date: null, rows: [] };
 
@@ -152,7 +172,7 @@ readRoutes.get('/items/:id', async (c) => {
   if (!id) return fail('id required', 400);
 
   const data = await withCache(c.env, `item:${id}`, ttl(c.env), async () => {
-    const [item, factor, forecast, kase, alerts] = await c.env.DB.batch([
+    const [item, factor, forecast, kase, alerts, metaRows] = await c.env.DB.batch([
       c.env.DB.prepare('SELECT * FROM items WHERE item_id = ?').bind(id),
       c.env.DB.prepare('SELECT * FROM factor_latest WHERE item_id = ?').bind(id),
       c.env.DB.prepare('SELECT * FROM forecast WHERE item_id = ? ORDER BY date DESC LIMIT 1').bind(id),
@@ -160,11 +180,21 @@ readRoutes.get('/items/:id', async (c) => {
         'SELECT cm.* FROM case_meta cm JOIN items i ON i.case_id = cm.case_id WHERE i.item_id = ?',
       ).bind(id),
       c.env.DB.prepare('SELECT level, score, ts, detail FROM alerts WHERE item_id = ? ORDER BY ts DESC LIMIT 20').bind(id),
+      c.env.DB.prepare("SELECT k, v FROM meta WHERE k = 'last_run'"),
     ]);
+    const fc = (forecast.results?.[0] as Record<string, unknown> | undefined) ?? null;
+    const lastRun = (metaRows.results?.[0] as { v?: string } | undefined)?.v ?? '';
+    if (fc) {
+      const stale = Boolean(lastRun && String(fc.date ?? '') < lastRun);
+      fc.stale = stale;
+      fc.staleReason = stale
+        ? `这条预测的数据日 ${fc.date} 早于最近一次运行（${lastRun}）——该品种不在当前截面里，下面是历史值，不代表当前建议`
+        : null;
+    }
     return {
       item: item.results?.[0] ?? null,
       factor: factor.results?.[0] ?? null,
-      forecast: forecast.results?.[0] ?? null,
+      forecast: fc,
       caseMeta: kase.results?.[0] ?? null,
       alerts: alerts.results ?? [],
     };

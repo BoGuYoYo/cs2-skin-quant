@@ -122,7 +122,7 @@ cp .env.example .env      # 填 STEAMDT_KEY / CF_PUSH_URL / INGEST_TOKEN / BARK_
 python -m pipeline.run_daily --dry-run
 ```
 
-跑回测验收（不推送、不出预测，只打印 walk-forward 结论）：
+跑回测验收（跳过采集，不做当日预测；打印 walk-forward 结论并把逐折净值写入 `backtest` 表）：
 
 ```bash
 python -m pipeline.run_daily --backtest

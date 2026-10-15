@@ -49,7 +49,7 @@ def _local():
 
 def describe() -> str:
     if MODE not in _VALID:
-        return f"PUSH_MODE='{MODE}' 无效（可选 {', '.join(sorted(_VALID))}），将退化为 none"
+        return f"PUSH_MODE='{MODE}' 无效（可选 {', '.join(sorted(_VALID))}），推送会显式失败"
     return {
         "local": "本地 SQLite 通道（自托管 API 用）",
         "worker": "Worker /api/ingest 通道",
@@ -85,6 +85,10 @@ def push(
     表生效，于是一天跑两次（07:00 + 19:00）云端告警就翻倍。
     所以补一个按时间戳划界的替换语义。
     """
+    if MODE not in _VALID:
+        raise ValueError(
+            f"PUSH_MODE='{MODE}' 无效（可选 {', '.join(sorted(_VALID))}）"
+        )
     if MODE == "none":
         log.info("stage=%s 跳过（PUSH_MODE=none）", stage)
         return 0
@@ -142,6 +146,9 @@ def push(
 def check() -> dict[str, Any]:
     """连通性自检，供 run_daily --check-push 调用"""
     out: dict[str, Any] = {"mode": MODE, "describe": describe()}
+    if MODE not in _VALID:
+        out["ok"] = False
+        return out
     if MODE in ("local", "both"):
         try:
             out["local"] = _local().check()

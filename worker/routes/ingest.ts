@@ -94,15 +94,30 @@ const BATCH_MAX = 900; // 免费档 1000，留出余量
  *   当前扫描结果一直展示（本地已经修掉，云端副本漏了）。
  * 白名单而不是随便什么表都能清：一个误传的布尔值不该能把历史表抹掉。
  */
-const REPLACE_ALL_STAGES = new Set(['factor_latest']);
+const REPLACE_ALL_STAGES = new Set(['factor_latest', 'backtest']);
 
-function insertSql(stage: Stage): string {
-  const ph = stage.cols.map(() => '?').join(',');
-  return `INSERT OR REPLACE INTO ${stage.table} (${stage.cols.join(',')}) VALUES (${ph})`;
+const COMPLETE_STAGES = new Set(['items', 'case_meta', 'snap_daily', 'kline', 'forecast', 'factor_latest', 'alerts', 'runs']);
+
+function colsForRow(stage: Stage, row: Record<string, unknown>): string[] {
+  if (COMPLETE_STAGES.has(stage.table)) return stage.cols;
+  return stage.cols.filter((col) => Object.prototype.hasOwnProperty.call(row, col) && row[col] !== null);
 }
 
-function rowToBind(row: Record<string, unknown>, stage: Stage): unknown[] {
-  return stage.cols.map((col) => {
+function insertSql(stage: Stage, cols: string[]): string {
+  const ph = cols.map(() => '?').join(',');
+  if (stage.pk.length > 0 && cols.some((c) => stage.pk.includes(c))) {
+    const updates = cols.filter((c) => !stage.pk.includes(c));
+    if (updates.length > 0) {
+      const sets = updates.map((c) => `${c}=excluded.${c}`).join(',');
+      return `INSERT INTO ${stage.table} (${cols.join(',')}) VALUES (${ph}) ON CONFLICT(${stage.pk.join(',')}) DO UPDATE SET ${sets}`;
+    }
+    return `INSERT OR IGNORE INTO ${stage.table} (${cols.join(',')}) VALUES (${ph})`;
+  }
+  return `INSERT OR REPLACE INTO ${stage.table} (${cols.join(',')}) VALUES (${ph})`;
+}
+
+function rowToBind(row: Record<string, unknown>, cols: string[]): unknown[] {
+  return cols.map((col) => {
     const v = row[col];
     if (v === undefined || v === null) return null;
     if (typeof v === 'boolean') return v ? 1 : 0;
@@ -171,12 +186,16 @@ ingestRoutes.post('/ingest', async (c) => {
     deleted += del.meta.changes ?? 0;
   }
 
-  const stmt = insertSql(stage);
   let inserted = 0;
   if (rows.length > 0) {
     for (let i = 0; i < rows.length; i += BATCH_MAX) {
       const chunk = rows.slice(i, i + BATCH_MAX) as Record<string, unknown>[];
-      const prepared = chunk.map((r) => db.prepare(stmt).bind(...rowToBind(r, stage)));
+      const prepared = chunk.flatMap((r) => {
+        const cols = colsForRow(stage, r);
+        if (cols.length === 0) return [];
+        return [db.prepare(insertSql(stage, cols)).bind(...rowToBind(r, cols))];
+      });
+      if (prepared.length === 0) continue;
       const results = await db.batch(prepared);
       for (const res of results) inserted += res.meta.changes ?? 0;
     }
@@ -184,17 +203,39 @@ ingestRoutes.post('/ingest', async (c) => {
 
   await db
     .prepare('INSERT INTO runs (ts, stage, ok, rows, message) VALUES (?,?,?,?,?)')
-    .bind(Date.now(), `ingest:${stageName}`, 1, inserted, `deleted=${deleted}`)
+    .bind(Math.floor(Date.now() / 1000), `ingest:${stageName}`, 1, inserted, `deleted=${deleted}`)
     .run();
 
   // 写完立刻让读缓存失效。
   // 不能靠短 TTL —— KV 的 expirationTtl 最小值是 60 秒（withCache 里被 Math.max(60,..) 夹住），
   // 意味着一次空结果会被缓存整整一分钟，前端就看不到刚写入的进度（踩过）。
   if (c.env.CACHE) {
-    const keys = stageName === 'task_progress'
-      ? ['progress']
-      : ['meta', 'progress'];
-    await Promise.all(keys.map((k) => c.env.CACHE!.delete(k).catch(() => undefined)));
+    try {
+      const exact: string[] = [];
+      const prefixes: string[] = [];
+      if (['forecast', 'factor_latest', 'items', 'case_meta'].includes(stageName)) exact.push('meta');
+      if (['forecast', 'factor_latest', 'items', 'case_meta'].includes(stageName)) prefixes.push('cand:');
+      if (['factor_latest', 'items', 'case_meta'].includes(stageName)) prefixes.push('scr:');
+      if (['forecast', 'factor_latest', 'items', 'case_meta'].includes(stageName)) prefixes.push('item:');
+      if (['items', 'case_meta'].includes(stageName)) prefixes.push('cs:');
+      if (stageName === 'alerts') prefixes.push('al:', 'item:');
+      if (stageName === 'backtest') exact.push('bt');
+      if (stageName === 'market_index') prefixes.push('mi:');
+      if (stageName === 'meta') exact.push('meta');
+      if (exact.length > 0) {
+        await Promise.all(exact.map((k) => c.env.CACHE!.delete(k).catch(() => undefined)));
+      }
+      for (const prefix of prefixes) {
+        let cursor: string | undefined;
+        do {
+          const listed = await c.env.CACHE!.list({ prefix, cursor });
+          await Promise.all(listed.keys.map((k) => c.env.CACHE!.delete(k.name).catch(() => undefined)));
+          cursor = listed.list_complete ? undefined : listed.cursor;
+        } while (cursor);
+      }
+    } catch {
+      // 缓存失效失败不能让已落库的写入被客户端重试。
+    }
   }
 
   return ok({ stage: stageName, received: rows.length, inserted, deleted });

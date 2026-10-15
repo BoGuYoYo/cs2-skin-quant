@@ -210,6 +210,10 @@ def walk_forward(df: pd.DataFrame, cfg: Cfg) -> tuple[pd.DataFrame, dict[str, fl
         base_rec: dict[str, float] = {}
         ya = ted["y"].to_numpy()
         y_tr = trd["y"].to_numpy()
+        rec["test_start"] = str(pd.to_datetime(ted["date"]).min().date())
+        rec["test_end"] = str(pd.to_datetime(ted["date"]).max().date())
+        rec["mean_21d"] = float(np.expm1(ya.mean()))
+        rec["win_rate"] = float((ya > 0).mean())
 
         for k, tau in enumerate(taus):
             rec[f"pinball_{tau}"] = pinball(ya, P[:, k], tau)
@@ -229,14 +233,18 @@ def walk_forward(df: pd.DataFrame, cfg: Cfg) -> tuple[pd.DataFrame, dict[str, fl
     return pd.DataFrame(rows), base
 
 
-def acceptance(metrics: pd.DataFrame, base: dict[str, float]) -> tuple[bool, list[str]]:
+def acceptance(
+    metrics: pd.DataFrame,
+    base: dict[str, float],
+    cfg: Cfg = CFG,
+) -> tuple[bool, list[str]]:
     """验收标准：跑不过这一关就不要上实盘"""
     notes: list[str] = []
     ok = True
     if metrics.empty:
         return False, ["没有产生任何折，样本量不足"]
 
-    for tau in sorted(CFG.quantiles):
+    for tau in sorted(cfg.quantiles):
         col = f"pinball_{tau}"
         if col not in metrics:
             continue

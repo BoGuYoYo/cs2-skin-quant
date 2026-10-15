@@ -7,13 +7,13 @@
 分位数回归的全部意义在 B 里的第一条：P10 折算回来还亏 → 直接排除。
 点预测做不到这件事，它只会告诉你「预期 +18%」，然后你在尾部亏掉本金。
 
-⚠️ 曾经在这里设计、但**从未接入**的三个函数已删除（需要时从 git 历史取回）：
+⚠️ 曾经在这里设计、但未接入本模块的三个函数已删除（需要时从 git 历史取回）：
     tranche()      分批建仓节奏（越接近 28 天跌势越接近满仓）
-    in_cooldown()  告警冷却（同一标的不在 N 小时内重复提醒）
+    in_cooldown()  告警冷却（现在由 run_daily 基于 alerts.pushed + cfg.levels 持久化实现）
     confirm()      闪崩二次确认（要求连续 confirm_n 个采样点都达标）
 截断而不是留着：无人调用的函数会随依赖（cfg 字段、numpy API）一起烂掉，
 而且让人以为「分批建仓/冷却/二次确认」已经生效了 —— 实际上线上一次都没跑过。
-要接的话，注意 decide() 目前是一次性满仓输出，冷却也没有落地到 alerts 表。
+分批与二次确认仍未接入；冷却已经落到 alerts.pushed，前端「已推送」显示真实状态。
 """
 from __future__ import annotations
 
@@ -57,7 +57,9 @@ def detect_anomaly(row: dict[str, Any], cfg: Cfg) -> tuple[str | None, float, st
 
     r7 = row.get("ret_7d")
     if r7 is not None and not _nan(r7) and r7 < 0:
-        score += min(abs(r7) / 0.06, 1.0) * 15
+        # 与 r21 一样先还原简单跌幅，再按同一阈值打分。
+        drop7 = abs(math.expm1(r7))
+        score += min(drop7 / 0.06, 1.0) * 15
         why.append(f"7日 {_simple_pct(r7):.1f}%")
 
     z = row.get("vol_z")

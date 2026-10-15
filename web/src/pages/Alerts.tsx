@@ -42,8 +42,8 @@ export default function Alerts() {
       </div>
 
       <div className="ark-note">
-        提醒会按冷却期去重（同品同级 2~12 小时只发一次）。这里展示的是落库后的完整历史，
-        手机推送只是它的一份拷贝——两者不一致时以本页为准。
+        手机提醒按冷却期去重（同品同级 2~12 小时只发一次）。当天看板会随最新一轮运行刷新，
+        历史日期保留；「已推送」表示手机通知已经成功送出。
       </div>
 
       <State loading={q.loading} error={q.error} empty={rows.length === 0} emptyText="还没有触发过告警">
@@ -67,7 +67,7 @@ export default function Alerts() {
                   <td><span className={`tag t-${levelTone(a.level)}`}>{a.level}</span></td>
                   <td>
                     <Link to={`/item/${encodeURIComponent(a.item_id)}`} className="item-cell">
-                      {a.image ? <img src={a.image} alt="" loading="lazy" /> : <img alt="" />}
+                      {a.image ? <img src={a.image} alt="" loading="lazy" /> : null}
                       <span className="nm">{a.name ?? a.item_id}</span>
                     </Link>
                   </td>

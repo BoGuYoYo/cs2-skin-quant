@@ -20,6 +20,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,15 @@ app.add_middleware(
 
 TOKEN = os.environ.get("INGEST_TOKEN", "")
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+try:      # 与 domain_exclude_sql 同一套哲学：拿不到就退化，绝不让整个 API 起不来
+    from pipeline.config import BEIJING  # noqa: E402
+except Exception as _e:                  # noqa: BLE001
+    from datetime import timedelta, timezone
+
+    BEIJING = timezone(timedelta(hours=8))
+    log.warning("pipeline.config 不可用（%s），滞后天数退回固定的 UTC+8", _e)
+
 DB_PATH = Path(os.environ.get("DB_PATH", "./state/skins.db"))
 if not DB_PATH.is_absolute():
     DB_PATH = HERE / DB_PATH
@@ -178,7 +188,19 @@ def meta() -> dict[str, Any]:
             ).fetchone()["n"],
             "alerts_total": con.execute("SELECT COUNT(*) AS n FROM alerts").fetchone()["n"],
         }
-        return ok({"latestForecastDate": day, "meta": {r["k"]: r["v"] for r in meta_rows}, "counts": counts})
+        age_days: int | None = None
+        if day:
+            try:
+                latest = datetime.strptime(day, "%Y-%m-%d").date()
+                age_days = max(0, (datetime.now(BEIJING).date() - latest).days)
+            except ValueError:
+                log.warning("latestForecastDate 不是日期：%s", day)
+        return ok({
+            "latestForecastDate": day,
+            "latestForecastAgeDays": age_days,
+            "meta": {r["k"]: r["v"] for r in meta_rows},
+            "counts": counts,
+        })
     finally:
         con.close()
 
@@ -451,10 +473,13 @@ def ingest(payload: dict, authorization: str | None = Header(default=None)) -> d
         stage, rows,
         replace_date=payload.get("replaceDate"),
         replace_series=payload.get("replaceSeries"),
+        replace_since_ts=payload.get("replaceSince"),
+        replace_all=payload.get("replaceAll") is True,
     )
     return ok({"stage": stage, "inserted": n})
 
 
+@app.post("/api/admin/refresh")
 @app.post("/admin/refresh")
 def admin_refresh(payload: dict | None = None, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     """触发一次完整管线（后台）"""

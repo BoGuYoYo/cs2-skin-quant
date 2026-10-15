@@ -13,12 +13,16 @@ const KLINE_RETAIN_DAYS = 800;
 const ALERT_RETAIN_DAYS = 180;
 const RUN_RETAIN_DAYS = 30;
 
+function beijingDate(ts = Date.now()): string {
+  return new Date(ts + 8 * 3600_000).toISOString().slice(0, 10);
+}
+
 async function runDaily(env: Env, cron: string): Promise<void> {
   const started = Date.now();
   const notes: string[] = [];
 
   try {
-    const cutoffKline = new Date(Date.now() - KLINE_RETAIN_DAYS * 86400_000).toISOString().slice(0, 10);
+    const cutoffKline = beijingDate(Date.now() - KLINE_RETAIN_DAYS * 86400_000);
     const d1 = await env.DB.prepare('DELETE FROM kline WHERE date < ?').bind(cutoffKline).run();
     notes.push(`kline_pruned=${d1.meta.changes ?? 0}`);
 
@@ -28,8 +32,11 @@ async function runDaily(env: Env, cron: string): Promise<void> {
 
     // runs 是纯日志表：每个 ingest 都写一行、cron 自己也写一行，只增不减
     // （审查发现）。不清的话 D1 存储会一直被日志吃掉。
-    const cutoffRun = Date.now() - RUN_RETAIN_DAYS * 86400_000;
-    const d3 = await env.DB.prepare('DELETE FROM runs WHERE ts < ?').bind(cutoffRun).run();
+    const cutoffRun = Math.floor((Date.now() - RUN_RETAIN_DAYS * 86400_000) / 1000);
+    const cutoffRunFuture = Math.floor(Date.now() / 1000) + 86400;
+    const d3 = await env.DB.prepare('DELETE FROM runs WHERE ts < ? OR ts > ?')
+      .bind(cutoffRun, cutoffRunFuture)
+      .run();
     notes.push(`runs_pruned=${d3.meta.changes ?? 0}`);
   } catch (e) {
     notes.push(`prune_failed=${(e as Error).message}`);
@@ -38,7 +45,7 @@ async function runDaily(env: Env, cron: string): Promise<void> {
   // 可选：回源触发服务器重算（需要配 UPSTREAM_BASE + INGEST_TOKEN）
   if (env.UPSTREAM_BASE) {
     try {
-      const res = await fetch(`${env.UPSTREAM_BASE.replace(/\/$/, '')}/admin/refresh`, {
+      const res = await fetch(`${env.UPSTREAM_BASE.replace(/\/$/, '')}/api/admin/refresh`, {
         method: 'POST',
         headers: { authorization: `Bearer ${env.INGEST_TOKEN}`, 'content-type': 'application/json' },
         body: JSON.stringify({ trigger: 'cron', cron }),
@@ -53,7 +60,7 @@ async function runDaily(env: Env, cron: string): Promise<void> {
   try {
     const r = await env.DB.prepare('SELECT MAX(date) AS d FROM forecast').first<{ d: string | null }>();
     const latest = r?.d ?? null;
-    const today = new Date().toISOString().slice(0, 10);
+    const today = beijingDate();
     if (latest) {
       const gap = Math.round((Date.parse(today) - Date.parse(latest)) / 86400_000);
       notes.push(`forecast_latest=${latest} gap_days=${gap}`);
@@ -66,7 +73,7 @@ async function runDaily(env: Env, cron: string): Promise<void> {
   }
 
   await env.DB.prepare('INSERT INTO runs (ts, stage, ok, rows, message) VALUES (?,?,?,?,?)')
-    .bind(Date.now(), 'cron', 1, 0, `${notes.join(' | ')} (${Date.now() - started}ms)`)
+    .bind(Math.floor(Date.now() / 1000), 'cron', 1, 0, `${notes.join(' | ')} (${Date.now() - started}ms)`)
     .run();
 }
 

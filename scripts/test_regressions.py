@@ -59,7 +59,12 @@ import push.dispatch as _dispatch  # noqa: E402
 import push.to_local as _to_local  # noqa: E402
 
 #: 打桩之前的默认路径 —— 也就是「真实库」。测试拿它来证明自己没碰生产数据。
-REAL_DB_PATH = _to_local._DB_PATH
+#: 默认 DB_PATH 是**相对路径**（./state/skins.db），按进程 CWD 解析 —— 从仓库根
+#: 目录跑测试时会指向 <root>/state/skins.db（甚至根本不存在），量到的是别的文件。
+#: 这里锚到 SERVER/state，保证「真实库毫发无损」这条断言量的是同一个生产库。
+_raw_db_path = Path(_to_local._DB_PATH).expanduser()
+REAL_DB_PATH = (_raw_db_path if _raw_db_path.is_absolute()
+                else SERVER / _raw_db_path).resolve()
 _dispatch.MODE = "local"                                    # type: ignore[assignment]
 _to_local._DB_PATH = Path(_TEST_TMP) / "push.db"            # type: ignore[assignment]
 
@@ -317,7 +322,11 @@ def test_no_constant_features_when_inputs_present() -> None:
         {"date": pd.Timestamp("2026-02-01"), "direction": "bearish", "confidence": 0.8},
         {"date": pd.Timestamp("2026-03-05"), "direction": "bullish", "confidence": 0.6},
     ])
-    feats = features.build(hist, case_df, None, events_df)
+    index_df = pd.DataFrame({
+        "date": pd.date_range("2026-01-01", periods=days, freq="D"),
+        "index_value": 100.0 * np.exp(np.cumsum(rng.normal(0.0003, 0.006, days))),
+    })
+    feats = features.build(hist, case_df, index_df, events_df)
 
     constants = []
     for c in FEATURE_COLS:
@@ -329,10 +338,14 @@ def test_no_constant_features_when_inputs_present() -> None:
           f"常数特征：{constants}" if constants else f"{len(FEATURE_COLS)} 个特征全部存活")
 
     # 反证：拿掉 case_id 这列，case_rarity_score 必须退回默认常数 50
-    bare = features.build(hist.drop(columns=["case_id", "case_name"]), case_df, None, events_df)
+    bare = features.build(hist.drop(columns=["case_id", "case_name"]), case_df, index_df, events_df)
     check("去掉 case_id 后稀有度确实退化成常数（说明检测有效）",
           bare["case_rarity_score"].nunique(dropna=True) == 1,
           f"unique={bare['case_rarity_score'].nunique(dropna=True)}")
+    missing_index = features.build(hist, case_df, None, events_df)
+    check("没有大盘时相对收益保持缺失，不冒充自身收益",
+          missing_index["rel_ret_21d"].isna().all(),
+          f"非空 {int(missing_index['rel_ret_21d'].notna().sum())} 行")
 
     # ---- 配置层面的两条不变量 ----
     overlap = set(FEATURE_COLS) & set(FEATURE_COLS_PENDING)
@@ -1594,7 +1607,7 @@ def test_push_replace_semantics() -> None:
     check("run_daily 会记录部分失败但继续推剩余 stage",
           "except dispatch.PartialPushError" in rd)
     check("factor_latest 推送带 replace_all", '"replace_all": True' in rd)
-    check("alerts 推送带 replace_since_ts", '"replace_since_ts": day_start' in rd)
+    check("alerts 推送带 replace_since_ts", 'dispatch.push("alerts", alert_rows, replace_since_ts=day_start)' in rd)
 
 
 def test_misc_hardening() -> None:
@@ -1835,7 +1848,8 @@ def test_review_9_fixes() -> None:
         check("挂单量采集有中文标签（原先掉到英文裸键）", "挂单量采集" in panel)
 
     # ---- 8) --dry-run 必须「什么也不改」----
-    check("dry-run 不再跑采集（原先 84 分钟还顺手写 snap/kline）", "elif dry_run:" in rd)
+    check("dry-run/backtest 不再跑采集（原先 84 分钟还顺手写 snap/kline）",
+          "elif dry_run or backtest_only:" in rd)
     check("dry-run 不上报进度（progress.report 会写库并推送各通道）",
           rd.count("if not dry_run:") >= 3)
     check("dry-run 不落盘模型（原先一次实验性重训就覆盖线上 model.pkl）",
@@ -1868,14 +1882,24 @@ def test_push_isolation_never_touches_real_db() -> None:
 
     # 功能证明：调用一个「会往通道推清空」的函数，真实库必须毫发无损
     def _fingerprint() -> tuple:
-        if not REAL_DB_PATH.exists():
-            return ("absent",)
-        st = REAL_DB_PATH.stat()
-        return (st.st_size, st.st_mtime_ns)
+        parts: list[tuple] = []
+        for p in (REAL_DB_PATH, Path(f"{REAL_DB_PATH}-wal"), Path(f"{REAL_DB_PATH}-shm")):
+            if p.exists():
+                st = p.stat()
+                parts.append((p.name, st.st_size, st.st_mtime_ns))
+        return tuple(parts) if parts else ("absent",)
 
     before = _fingerprint()
+    if before == ("absent",):
+        print(f"  [SKIP] 本机没有生产库 {REAL_DB_PATH}，无法做指纹对比")
+        return
     # 放进进程级临时目录（退出时 ignore_errors 清理）—— 不用 TemporaryDirectory：
     # Windows 上 sqlite 连接即使 close 也可能晚一点释放句柄，rmtree 会炸在退出前
+    proof_db = Path(_TEST_TMP) / "isolation-proof.db"
+    real_stub = tl._DB_PATH
+    tl._DB_PATH = proof_db  # type: ignore[assignment]
+    if proof_db.exists():
+        proof_db.unlink()
     iso = Path(_TEST_TMP) / "iso.db"
     con = sqlite3.connect(str(iso))
     try:
@@ -1883,12 +1907,80 @@ def test_push_isolation_never_touches_real_db() -> None:
         run_daily.abort_no_cross_section(con, "1999-01-01", dry_run=False)
     finally:
         con.close()
+        tl._DB_PATH = real_stub  # type: ignore[assignment]
     check("调用 abort_no_cross_section 后真实库一个字节都没变",
           _fingerprint() == before, f"{before} -> {_fingerprint()}")
 
     # 反向证明：桩确实拆掉过（否则上面那条是空断言）
-    check("临时库确实被写过（证明断言不是空跑）",
-          Path(tl._DB_PATH).exists())
+    check("临时推送库确实被本次调用创建（证明断言不是空跑）",
+          proof_db.exists())
+
+
+def test_round10_fixes() -> None:
+    """第十轮：看板口径、回测产物、冷却和并发入口。"""
+    print("\n[45] 第十轮修复")
+    import sqlite3  # noqa: PLC0415
+
+    from pipeline import run_daily  # noqa: PLC0415
+    from pipeline.config import Cfg  # noqa: PLC0415
+
+    metrics = pd.DataFrame([
+        {"test_end": "2026-01-31", "mean_21d": 0.10, "win_rate": 0.60, "n_test": 100},
+        {"test_end": "2026-02-28", "mean_21d": 0.20, "win_rate": 0.65, "n_test": 110},
+    ])
+    rows = run_daily.backtest_rows(metrics, CFG)
+    check("回测曲线把逐折简单收益复利累计", rows[-1]["cum"] == 0.32,
+          f"cum={rows[-1]['cum']}")
+    check("回测均收益保持简单收益率口径", rows[-1]["mean_21d"] == 0.20,
+          f"mean={rows[-1]['mean_21d']}")
+
+    with tempfile.TemporaryDirectory() as td:
+        con = sqlite3.connect(str(Path(td) / "alerts.db"))
+        try:
+            con.execute(
+                "CREATE TABLE alerts (item_id TEXT, level TEXT, ts INTEGER, pushed INTEGER)"
+            )
+            now = 1_800_000_000
+            con.execute("INSERT INTO alerts VALUES ('A', 'L3', ?, 1)", (now - 600,))
+            con.execute("INSERT INTO alerts VALUES ('B', 'L3', ?, 1)", (now - 10 * 3600,))
+            cooling = run_daily.recent_pushed_alerts(con, now, CFG)
+            check("冷却期命中时不再重复推送", ("A", "L3") in cooling, f"{cooling}")
+            check("超出该等级冷却期后允许再次推送", ("B", "L3") not in cooling, f"{cooling}")
+        finally:
+            con.close()
+
+    with tempfile.TemporaryDirectory() as td:
+        cfg = Cfg(
+            state_dir=Path(td),
+            db_path=Path(td) / "skins.db",
+            model_path=Path(td) / "model.pkl",
+        )
+        first = run_daily.acquire_run_lock(cfg)
+        second = run_daily.acquire_run_lock(cfg)
+        check("管线锁阻止第二个 run_daily 实例", first is not None and second is None,
+              f"first={getattr(first, 'path', first)}, second={second}")
+        run_daily.release_run_lock(first)
+        third = run_daily.acquire_run_lock(cfg)
+        check("持锁进程退出后锁可回收", third is not None, f"{third}")
+        run_daily.release_run_lock(third)
+
+    app_src = (SERVER / "app.py").read_text(encoding="utf-8")
+    web_api = (SERVER.parent / "web" / "src" / "lib" / "api.ts").read_text(encoding="utf-8")
+    check("meta 接口由服务器按北京时间计算滞后天数",
+          "latestForecastAgeDays" in app_src and "datetime.now(BEIJING)" in app_src)
+    check("前端类型契约包含服务器滞后天数", "latestForecastAgeDays" in web_api)
+    check("本地 ingest 不再漏传 replaceSince / replaceAll",
+          'replace_since_ts=payload.get("replaceSince")' in app_src
+          and 'replace_all=payload.get("replaceAll") is True' in app_src)
+
+    ingest_src = (SERVER.parent / "worker" / "routes" / "ingest.ts").read_text(encoding="utf-8")
+    cron_src = (SERVER.parent / "worker" / "cron.ts").read_text(encoding="utf-8")
+    check("Worker 进度/meta 走按字段 UPSERT，不用整行 REPLACE",
+          "colsForRow" in ingest_src and "ON CONFLICT" in ingest_src)
+    check("runs 保留线统一使用秒级时间戳",
+          "Math.floor((Date.now()" in cron_src and "Math.floor(Date.now() / 1000)" in ingest_src)
+    check("Worker 缓存按 stage 失效而不是只删不存在的 progress 键",
+          "prefixes.push('cand:')" in ingest_src and "'progress'" not in ingest_src)
 
 
 def main() -> int:
@@ -1939,6 +2031,7 @@ def main() -> int:
     test_misc_hardening()
     test_review_9_fixes()
     test_push_isolation_never_touches_real_db()
+    test_round10_fixes()
     print("\n" + "=" * 62)
     if FAIL:
         print(f"结果：{len(FAIL)} 项失败 → {FAIL}")

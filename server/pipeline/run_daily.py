@@ -3,7 +3,7 @@
 用法：
     python -m pipeline.run_daily                 # 完整跑一遍并推送
     python -m pipeline.run_daily --dry-run       # 只算不写：不采集、不落盘模型、不推送
-    python -m pipeline.run_daily --backtest      # 只做 walk-forward 评估，打印验收结论
+    python -m pipeline.run_daily --backtest      # 跳过采集，walk-forward 评估并写入 backtest 表
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import os
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
@@ -68,6 +69,116 @@ def today_str() -> str:
 def day_start_ts(day: str) -> int:
     """某天（北京）零点的 epoch —— 用于「清理今日旧告警」这类按天划界的操作"""
     return int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=BEIJING).timestamp())
+
+
+def recent_pushed_alerts(con, now_ts: int, cfg: Cfg) -> set[tuple[str, str]]:
+    """返回仍处于冷却期的 (item_id, level)。
+
+    alerts.pushed 只表示「这个告警曾经成功送出」。冷却期按 cfg.levels 的
+    每级小时数计算；同品同级命中时，本轮只更新看板行，不再重复发手机通知。
+    """
+    cooldown = {level: hours for level, _drop, _z, hours in cfg.levels}
+    if not cooldown:
+        return set()
+    oldest = now_ts - max(cooldown.values()) * 3600
+    try:
+        rows = con.execute(
+            "SELECT item_id, level, MAX(ts) AS last_ts FROM alerts "
+            "WHERE pushed = 1 AND ts >= ? GROUP BY item_id, level",
+            (oldest,),
+        ).fetchall()
+    except Exception as e:      # noqa: BLE001
+        log.warning("读取告警冷却状态失败（本轮按无状态处理）：%s", e)
+        return set()
+    out: set[tuple[str, str]] = set()
+    for item_id, level, last_ts in rows:
+        hours = cooldown.get(level)
+        if hours is None or not item_id or not last_ts:
+            continue
+        if now_ts - int(last_ts) < hours * 3600:
+            out.add((str(item_id), str(level)))
+    return out
+
+
+def backtest_rows(metrics: pd.DataFrame, cfg: Cfg) -> list[dict[str, Any]]:
+    """把逐折 walk-forward 指标转成看板用的累计净值序列。"""
+    if metrics.empty or "mean_21d" not in metrics.columns:
+        return []
+    rows: list[dict[str, Any]] = []
+    cum = 0.0
+    for _, r in metrics.sort_values("test_end").iterrows():
+        mean_21d = float(r["mean_21d"])
+        if not math.isfinite(mean_21d):
+            continue
+        cum = (1.0 + cum) * (1.0 + mean_21d) - 1.0
+        rows.append({
+            "date": str(r["test_end"]),
+            "mean_21d": round(mean_21d, 6),
+            "cum": round(cum, 6),
+            "win_rate": round(float(r["win_rate"]), 6),
+            "n": int(r["n_test"]),
+            "model_version": cfg.model_version,
+        })
+    return rows
+
+
+class RunLock:
+    """持有 OS 级文件锁；进程退出时内核会自动释放。"""
+
+    def __init__(self, path: Path, handle: Any) -> None:
+        self.path = path
+        self._handle = handle
+
+
+def acquire_run_lock(cfg: Cfg) -> RunLock | None:
+    """用 flock/msvcrt 获取非阻塞排他锁，避免 PID 存活判断的竞态。"""
+    lock = cfg.state_dir / "run_daily.lock"
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    f = open(lock, "a+", encoding="ascii")
+    try:
+        f.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            if f.seek(0, os.SEEK_END) == 0:
+                f.write(" ")
+                f.flush()
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        f.seek(0)
+        f.truncate()
+        json.dump({"pid": os.getpid(), "started_at": int(time.time())}, f)
+        f.flush()
+        return RunLock(lock, f)
+    except (OSError, BlockingIOError):
+        f.close()
+        return None
+    except Exception:
+        f.close()
+        raise
+
+
+def release_run_lock(lock: RunLock | None) -> None:
+    if lock is None:
+        return
+    try:
+        lock._handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(lock._handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock._handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        lock._handle.close()
 
 
 def prune_factor_latest(con, keep_ids: Iterable[str]) -> int:
@@ -350,7 +461,7 @@ def _apply_freshness_gate(latest: pd.DataFrame, cfg: Cfg, day: str) -> pd.DataFr
         warm = pd.Series(True, index=latest.index)
 
     keep = fresh & warm
-    n_cold = int((~(fresh & warm)).sum()) - n_stale      # 只冷不旧的那部分
+    n_cold = int((~(fresh & warm)).sum()) - n_stale - n_future
     log.info("新鲜度/预热闸门：基准日 %s（北京），行情超 %d 天的 %d 个、"
              "未来日期 %d 个、未预热的 %d 个；保留 %d/%d",
              day, cfg.infer_max_age_days, n_stale, n_future, max(n_cold, 0),
@@ -490,11 +601,11 @@ def _push_cold_start(con, cfg: Cfg, day: str, now_ts: int, labeled, reason: str)
 
 
 # ------------------------------------------------------------------ 主流程
-def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool = False) -> int:
+def _run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool = False) -> int:
     cfg = CFG
     cfg.ensure_dirs()
     key = os.environ.get("STEAMDT_KEY", "")
-    if not key and not skip_collect:
+    if not key and not skip_collect and not backtest_only:
         log.error("STEAMDT_KEY 未配置，退出")
         return 2
 
@@ -511,7 +622,7 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
     watchlist = load_watchlist(con)
     if skip_collect:
         log.info("--skip-collect：跳过采集，直接用库里的历史（监控池 %d 个）", len(watchlist))
-    elif dry_run:
+    elif dry_run or backtest_only:
         # ⚠️ --dry-run 的约定是「什么也不改」（审查 9 发现）：
         # 原先试跑照样跑完整采集 —— 84 分钟，还把行情写进 snap/kline。
         # 试跑想快速看新特征/新模型的效果，就不该顺手改行情库。
@@ -595,6 +706,29 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
         for line in notes:
             log.info("  %s", line)
         log.info("验收结论：%s", "通过" if ok else "未通过")
+        rows = backtest_rows(metrics, cfg)
+        if rows and not dry_run:
+            try:
+                from push import to_local
+
+                to_local.ensure_schema(con)
+                # 不变量：禁 INSERT OR REPLACE（它的语义是删行重插）；按主键做 UPSERT。
+                con.executemany(
+                    "INSERT INTO backtest "
+                    "(date, mean_21d, cum, win_rate, n, model_version) "
+                    "VALUES (:date, :mean_21d, :cum, :win_rate, :n, :model_version) "
+                    "ON CONFLICT(date) DO UPDATE SET "
+                    "mean_21d=excluded.mean_21d, cum=excluded.cum, "
+                    "win_rate=excluded.win_rate, n=excluded.n, "
+                    "model_version=excluded.model_version",
+                    rows,
+                )
+                con.commit()
+                dispatch.push("backtest", rows, replace_all=True)
+                log.info("backtest 已写入本地并推送 %d 行", len(rows))
+            except Exception as e:      # noqa: BLE001
+                log.error("backtest 写入/推送失败：%s", e)
+                return 6
         return 0 if ok else 1
 
     # ---------------- 4. 模型 + 校准 ----------------
@@ -808,6 +942,10 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
     # 又只对含 date 的表生效（alerts 只有 ts）。所以推送时还要带上
     # replace_since_ts，让云端也按同一个时间界删一遍。
     day_start = day_start_ts(day)
+    cooling = recent_pushed_alerts(con, now_ts, cfg)
+    for a in alert_rows:
+        if (str(a["item_id"]), str(a["level"])) in cooling:
+            a["pushed"] = 1
     try:
         n_del = con.execute("DELETE FROM alerts WHERE ts >= ?", (day_start,)).rowcount
         con.commit()
@@ -825,7 +963,6 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
             # 品种会留着旧行，而筛选接口不看日期 —— 旧行会一直被当成当前结果
             ("factor_latest", factor_rows, {"replace_all": True}),
             ("forecast", forecast_rows, {"replace_date": day}),
-            ("alerts", alert_rows, {"replace_since_ts": day_start}),
             (
                 "meta",
                 [
@@ -899,14 +1036,43 @@ def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool =
         log.info("L3 告警 %d 条，按分数取前 %d 条推送（其余留在看板）",
                  len(l3_alerts), min(len(l3_alerts), cfg.alert_push_max))
     for a in l3_alerts[: cfg.alert_push_max]:
-        notify.notify_item(
+        if a.get("pushed"):
+            continue
+        sent = notify.notify_item(
             a["name"] or a["item_id"], a["level"],
             float(price_by_item.get(a["item_id"]) or 0.0),
             a["detail"] or "",
         )
+        if sent:
+            # 只改内存里这份快照：当天旧行已在上面的 DELETE 里清掉，而真正的
+            # INSERT 在下面的 dispatch.push("alerts", …) 里 —— 此处若去 UPDATE
+            # 数据库，影响行数恒为 0（行还没插进去），只会误导后来人。
+            a["pushed"] = 1
+
+    # 通知结果（pushed）也要进入本地和云端副本。replace_since_ts 会先清掉
+    # 当天旧行再插入，因此既不会翻倍，也不会留下 pushed=0 的旧副本。
+    try:
+        dispatch.push("alerts", alert_rows, replace_since_ts=day_start)
+    except dispatch.PartialPushError as e:
+        fails.append(f"alerts 部分通道失败: {e}")
+        log.error("alerts 部分通道失败：%s", e)
+    except Exception as e:      # noqa: BLE001
+        fails.append(f"alerts 推送失败: {e}")
+        log.error("alerts 推送失败：%s", e)
 
     _print_top(candidates)
     return 0 if not fails else 6
+
+
+def run(dry_run: bool = False, backtest_only: bool = False, skip_collect: bool = False) -> int:
+    lock = acquire_run_lock(CFG)
+    if lock is None:
+        log.error("已有 run_daily 实例正在运行，本次退出（锁：%s）", CFG.state_dir / "run_daily.lock")
+        return 7
+    try:
+        return _run(dry_run=dry_run, backtest_only=backtest_only, skip_collect=skip_collect)
+    finally:
+        release_run_lock(lock)
 
 
 # ------------------------------------------------------------------ 小工具
@@ -989,7 +1155,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="skin-alpha 每日管线")
     ap.add_argument("--dry-run", action="store_true",
                     help="只计算：不采集、不落盘模型、不推送（什么也不改）")
-    ap.add_argument("--backtest", action="store_true", help="只做 walk-forward 评估并打印验收结论")
+    ap.add_argument("--backtest", action="store_true",
+                    help="跳过采集，做 walk-forward 评估、打印结论并写入 backtest 表")
     ap.add_argument("--skip-collect", action="store_true",
                     help="跳过采集（复用库里已有历史）—— 改完特征/模型后快速重跑用，"
                          "省掉 3.2 小时的 K 线采集")
@@ -1003,7 +1170,7 @@ def main() -> int:
             v.get("ok", False)
             for k, v in result.items()
             if k in ("worker", "d1") and isinstance(v, dict)
-        )
+        ) and result.get("ok", True) is not False
         return 0 if ok else 1
 
     return run(dry_run=args.dry_run, backtest_only=args.backtest, skip_collect=args.skip_collect)

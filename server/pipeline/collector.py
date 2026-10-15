@@ -1080,14 +1080,23 @@ def backfill_from_dump(con: sqlite3.Connection, dump_dir: str | Path) -> int:
             continue
         for _, r in d.iterrows():
             try:
-                day = pd.to_datetime(r[date_col]).strftime("%Y-%m-%d")
-            except Exception:
+                observed = pd.to_datetime(r[date_col], errors="coerce", utc=True)
+                if pd.isna(observed):
+                    continue
+                day = observed.strftime("%Y-%m-%d")
+                ts = int(observed.timestamp())
+                price = float(r[price_col])
+                if not math.isfinite(price) or price <= 0:
+                    continue
+            except (TypeError, ValueError):
                 continue
-            con.execute(
-                "INSERT OR IGNORE INTO snap (item_id, date, sell, bid, listings, volume, supply, ts) VALUES (?,?,?,?,?,?,?,?)",
-                (str(r[name_col]), day, float(r[price_col]), None, None, None, None, int(time.time())),
+            cur = con.execute(
+                "INSERT OR IGNORE INTO snap "
+                "(item_id, date, sell, bid, listings, volume, supply, ts, src) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (str(r[name_col]), day, price, None, None, None, None, ts, PRICE_PLATFORM),
             )
-            n += 1
+            n += max(cur.rowcount or 0, 0)
         con.commit()
         log.info("回填 %s：累计 %d 行", csv.name, n)
     return n

@@ -1,6 +1,6 @@
 """通知通道：Bark(iOS) / 企业微信机器人 / 飞书机器人。
 
-只负责「推出去」，去重与冷却在 decide/alerting 层做——不要在这里判断业务。
+只负责「推出去」，去重与冷却在 run_daily 的 alerts.pushed 状态上做——不要在这里判断业务。
 """
 from __future__ import annotations
 

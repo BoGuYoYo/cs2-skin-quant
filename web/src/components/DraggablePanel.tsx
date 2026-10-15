@@ -6,6 +6,7 @@ interface Props {
   /** 是否处于可编辑（拖拽）模式 */
   editing: boolean;
   onDropPanel: (draggedId: string, targetId: string) => void;
+  onMovePanel?: (id: string, delta: number) => void;
   children: ReactNode;
   className?: string;
 }
@@ -17,7 +18,7 @@ interface Props {
  * 用 HTML5 原生拖放而非第三方库：零依赖，且键盘用户仍可通过编辑模式下的
  * 「上移/下移」按钮调整（见 aria-label）。
  */
-export function DraggablePanel({ id, editing, onDropPanel, children, className = '' }: Props) {
+export function DraggablePanel({ id, editing, onDropPanel, onMovePanel, children, className = '' }: Props) {
   const [over, setOver] = useState(false);
 
   if (!editing) {
@@ -46,6 +47,28 @@ export function DraggablePanel({ id, editing, onDropPanel, children, className =
       }}
       aria-label="可拖拽面板"
     >
+      {onMovePanel && (
+        <div className="ark-panelMove" role="group" aria-label="调整面板顺序">
+          <button
+            type="button"
+            className="ark-btn"
+            aria-label="上移"
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={() => onMovePanel(id, -1)}
+          >
+            ↑
+          </button>
+          <button
+            type="button"
+            className="ark-btn"
+            aria-label="下移"
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={() => onMovePanel(id, 1)}
+          >
+            ↓
+          </button>
+        </div>
+      )}
       {children}
     </div>
   );

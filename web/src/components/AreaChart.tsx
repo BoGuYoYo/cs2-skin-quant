@@ -13,6 +13,8 @@ export function AreaChart({ data, height = 200, color = '#4d9fff' }: Props) {
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Area'> | null>(null);
 
+  const hasData = data.length > 0;
+
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
@@ -48,7 +50,7 @@ export function AreaChart({ data, height = 200, color = '#4d9fff' }: Props) {
       chartRef.current = null;
       seriesRef.current = null;
     };
-  }, [height, color]);
+  }, [height, color, hasData]);
 
   useEffect(() => {
     if (!seriesRef.current || data.length === 0) return;
@@ -56,6 +58,6 @@ export function AreaChart({ data, height = 200, color = '#4d9fff' }: Props) {
     chartRef.current?.timeScale().fitContent();
   }, [data]);
 
-  if (data.length === 0) return <div className="empty">暂无数据</div>;
+  if (!hasData) return <div className="empty">暂无数据</div>;
   return <div ref={hostRef} className="chart" style={{ height }} />;
 }

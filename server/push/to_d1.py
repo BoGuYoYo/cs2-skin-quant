@@ -67,6 +67,9 @@ STAGES: dict[str, list[str]] = {
                       "rows", "rate_per_min", "eta_minutes", "message", "started_at", "updated_at"],
 }
 
+#: 只有「当前快照」型表允许整表替换，防止误传布尔值清掉历史表。
+REPLACE_ALL_STAGES = frozenset({"factor_latest", "backtest"})
+
 
 class D1Error(RuntimeError):
     pass
@@ -288,6 +291,8 @@ def push(
     #   - forecast / factor_latest：abort_no_cross_section 想把
     #     「今天没有截面」推上云端，只能推空列表 —— 同样被跳过。
     # 删除与插入是两件事，不能共用「有没有行」这一个前置条件。
+    if replace_all and stage not in REPLACE_ALL_STAGES:
+        raise D1Error(f"stage={stage} 不支持 replace_all")
     if replace_all:
         changed += _query(f"DELETE FROM {table}", [])
     if replace_date and "date" in cols:

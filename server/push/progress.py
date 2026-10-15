@@ -51,7 +51,7 @@ def progress_fields(
     """由循环变量算出速率的 ETA —— 让前端能直接显示「剩余 X 分钟」"""
     elapsed = max(time.time() - t0, 1e-6)
     rate = i / elapsed * 60.0
-    eta = (total - i) / max(rate, 1e-6)
+    eta = (total - i) / rate if rate > 0 and i < total else None
     return {
         "total": total,
         "done": i,
@@ -60,6 +60,6 @@ def progress_fields(
         "fail": fail,
         "rows": rows,
         "rate_per_min": round(rate, 1),
-        "eta_minutes": round(eta, 1),
+        "eta_minutes": round(eta, 1) if eta is not None else None,
         "started_at": started_at,
     }

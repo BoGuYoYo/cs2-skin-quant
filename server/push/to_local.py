@@ -180,6 +180,9 @@ COMPLETE_STAGES: frozenset[str] = frozenset({
     "case_meta",       # 箱子全量
 })
 
+#: 与 Worker / D1 通道保持同一份整表替换白名单。
+REPLACE_ALL_STAGES: frozenset[str] = frozenset({"factor_latest", "backtest"})
+
 
 def push(
     stage: str,
@@ -211,6 +214,8 @@ def push(
         or (replace_series is not None and "item_id" in cols)
         or (replace_since_ts is not None and "ts" in cols)
     )
+    if replace_all and stage not in REPLACE_ALL_STAGES:
+        raise ValueError(f"stage={stage} 不支持 replace_all")
     if not rows and not has_replace:
         return 0
 

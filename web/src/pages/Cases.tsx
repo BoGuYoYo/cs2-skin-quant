@@ -8,6 +8,7 @@ export default function Cases() {
   const [sort, setSort] = useState('rarity');
   const [limit, setLimit] = useState(100);
   const q = useApi(() => api.cases({ sort, limit }), [sort, limit]);
+  const hasVolume = (q.data ?? []).some((c) => c.case_volume_30d !== null);
 
   return (
     <>
@@ -22,7 +23,12 @@ export default function Cases() {
           <button className={sort === 'rarity' ? 'ark-btn is-primary' : 'ark-btn'} onClick={() => setSort('rarity')}>
             按稀有度
           </button>
-          <button className={sort === 'volume' ? 'ark-btn is-primary' : 'ark-btn'} onClick={() => setSort('volume')}>
+          <button
+            className={sort === 'volume' ? 'ark-btn is-primary' : 'ark-btn'}
+            disabled={!hasVolume}
+            title={hasVolume ? undefined : '当前没有箱子成交量数据'}
+            onClick={() => setSort('volume')}
+          >
             按开箱量
           </button>
           <button className="ark-btn" onClick={() => q.reload()}>刷新</button>

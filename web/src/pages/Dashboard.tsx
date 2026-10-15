@@ -8,14 +8,14 @@ import { CandidateTable } from '../components/CandidateTable';
 import { State } from '../components/State';
 import { ProgressPanel } from '../components/ProgressPanel';
 import { DraggablePanel } from '../components/DraggablePanel';
-import { int, levelTone, logPct, pct, relTime } from '../lib/format';
+import { int, levelTone, pct, relTime } from '../lib/format';
 
 /** 面板顺序可拖拽调整，存 localStorage */
 const DEFAULT_ORDER = ['progress', 'candidates', 'market', 'backtest', 'alerts'];
 
 export default function Dashboard() {
   const [editing, setEditing] = useState(false);
-  const { order, move, reset } = useDragOrder('skin-alpha:dashboard-order', DEFAULT_ORDER);
+  const { order, move, moveBy, reset } = useDragOrder('skin-alpha:dashboard-order', DEFAULT_ORDER);
 
   const meta = useApi(() => api.meta(), []);
   const idx = useApi(() => api.marketIndex(365), []);
@@ -23,11 +23,12 @@ export default function Dashboard() {
   const alerts = useApi(() => api.alerts({ limit: 8 }), []);
   const bt = useApi(() => api.backtest(), []);
 
-  const gapDays = meta.data?.latestForecastDate
-    ? Math.round((Date.now() - Date.parse(meta.data.latestForecastDate)) / 86400_000)
-    : null;
+  const gapDays = meta.data?.latestForecastAgeDays ?? null;
   const btRows = bt.data ?? [];
   const btLast = btRows.length ? btRows[btRows.length - 1] : null;
+  const marketRows = (idx.data ?? [])
+    .filter((r) => r.index_value !== null)
+    .map((r) => ({ date: r.date, value: r.index_value as number }));
 
   const panel = (title: string, en: string, body: ReactNode, tone?: 'ink'): ReactNode => (
     <section className="ark-panel" data-tone={tone}>
@@ -57,11 +58,9 @@ export default function Dashboard() {
     market: panel(
       '大盘指数',
       'MARKET INDEX / RELATIVE STRENGTH BASE',
-      <State loading={idx.loading} error={idx.error} empty={(idx.data ?? []).length === 0}>
+      <State loading={idx.loading} error={idx.error} empty={marketRows.length === 0}>
         <AreaChart
-          data={(idx.data ?? [])
-            .filter((r) => r.index_value !== null)
-            .map((r) => ({ date: r.date, value: r.index_value as number }))}
+          data={marketRows}
           height={190}
         />
       </State>,
@@ -77,7 +76,7 @@ export default function Dashboard() {
         />
         {btLast && (
           <p className="ark-dim ark-mono" style={{ fontSize: 11, marginTop: 8 }}>
-            样本 {int(btLast.n)} · 胜率 {pct(btLast.win_rate, 0)} · 最新周期 {logPct(btLast.mean_21d, 2)}
+            样本 {int(btLast.n)} · 胜率 {pct(btLast.win_rate, 0)} · 最新周期 {pct(btLast.mean_21d, 2)}
           </p>
         )}
       </State>,
@@ -165,7 +164,7 @@ export default function Dashboard() {
             <div className="l">覆盖武器箱</div>
           </div>
           <div className="ark-stat">
-            <div className="v">{btLast ? logPct(btLast.cum, 1) : '—'}</div>
+            <div className="v">{btLast ? pct(btLast.cum, 1) : '—'}</div>
             <div className="l">回测累计净收益</div>
           </div>
         </div>
@@ -187,7 +186,8 @@ export default function Dashboard() {
             id={id}
             editing={editing}
             onDropPanel={move}
-            className={id === 'progress' || id === 'candidates' ? '' : ''}
+            onMovePanel={moveBy}
+            className=""
           >
             {panels[id] ?? null}
           </DraggablePanel>

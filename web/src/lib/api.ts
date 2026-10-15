@@ -36,6 +36,8 @@ async function get<T>(path: string, params: Params = {}): Promise<T> {
 // ------------------------------------------------------------------ 类型
 export interface Meta {
   latestForecastDate: string | null;
+  /** 服务器按北京时间计算的滞后天数；浏览器时钟不参与。 */
+  latestForecastAgeDays: number | null;
   meta: Record<string, string>;
   counts: {
     items: number;

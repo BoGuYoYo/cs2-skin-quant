@@ -15,7 +15,7 @@ export function ItemCell({
 }) {
   return (
     <Link to={`/item/${encodeURIComponent(id)}`} className="item-cell">
-      {image ? <img src={image} alt="" loading="lazy" /> : <img alt="" />}
+      {image ? <img src={image} alt="" loading="lazy" /> : null}
       <span>
         <span className="nm">{name ?? id}</span>
         {caseName ? <span className="cs"> · {caseName}</span> : null}
@@ -28,17 +28,18 @@ interface Props {
   rows: Candidate[];
   compact?: boolean;
   sortKey?: string;
+  sortDir?: 'asc' | 'desc';
   onSort?: (key: string) => void;
 }
 
-export function CandidateTable({ rows, compact = false, sortKey, onSort }: Props) {
+export function CandidateTable({ rows, compact = false, sortKey, sortDir = 'desc', onSort }: Props) {
   const th = (key: string, label: string, cls = '') => (
     <th
       className={`${cls} ${onSort ? 'sortable' : ''}`}
       onClick={onSort ? () => onSort(key) : undefined}
     >
       {label}
-      {sortKey === key ? ' ▾' : ''}
+      {sortKey === key ? (sortDir === 'asc' ? ' ▴' : ' ▾') : ''}
     </th>
   );
 
@@ -53,8 +54,9 @@ export function CandidateTable({ rows, compact = false, sortKey, onSort }: Props
             {th('rarity', '箱稀有度', 'num')}
             {th('turnover', '换手率', 'num')}
             {th('q10', 'P10', 'num')}
-            {th('score', 'P50', 'num')}
+            <th className="num">P50</th>
             <th className="num">P90</th>
+            {th('score', '打分', 'num')}
             <th className="num">反弹≥10%</th>
             <th className="num">仓位</th>
             <th>判断</th>
@@ -66,7 +68,7 @@ export function CandidateTable({ rows, compact = false, sortKey, onSort }: Props
             const side = sideLabel(r.side);
             const fit = windowFit(r.drop_duration_days);
             const rt = rarityTone(r.case_rarity_score);
-            const p10Tone = (r.q10_adj ?? 0) <= 0 ? 'neg' : 'pos';
+            const p10Tone = r.q10_adj === null ? 'dim' : r.q10_adj <= 0 ? 'neg' : 'pos';
             return (
               <tr key={r.item_id}>
                 <td>
@@ -80,9 +82,14 @@ export function CandidateTable({ rows, compact = false, sortKey, onSort }: Props
                   <span className={`tag t-${rt}`}>{num(r.case_rarity_score, 0)}</span>
                 </td>
                 <td className="num">{pct(r.turnover, 2)}</td>
-                <td className={`num ${p10Tone}`}>{logPct(r.q10_adj ?? r.q10)}</td>
+                <td className={`num ${p10Tone}`} title={r.q10_adj === null ? '校准后 P10 缺失' : undefined}>
+                  {logPct(r.q10_adj)}
+                </td>
                 <td className="num">{logPct(r.q50)}</td>
-                <td className="num dim">{logPct(r.q90_adj ?? r.q90)}</td>
+                <td className="num dim" title={r.q90_adj === null ? '校准后 P90 缺失' : undefined}>
+                  {logPct(r.q90_adj)}
+                </td>
+                <td className="num">{num(r.score, 1)}</td>
                 <td className="num">{r.prob_up === null ? '—' : pct(r.prob_up, 0)}</td>
                 <td className="num">{r.size ? pct(r.size, 2) : '—'}</td>
                 <td>
